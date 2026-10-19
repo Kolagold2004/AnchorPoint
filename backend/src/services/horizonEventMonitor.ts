@@ -2,6 +2,7 @@
 // Description: Monitors Stellar Horizon API for account events, manages durable subscriptions, retries failed webhooks, deduplicates events, and supports custom event filtering.
 
 import axios from 'axios';
+import { createHmac } from 'node:crypto';
 import { EventEmitter } from 'events';
 import { getLastLedgerOffset, setLastLedgerOffset } from '../utils/ledgerOffsetStore';
 
@@ -9,6 +10,7 @@ interface Subscription {
   id: string;
   account: string;
   webhookUrl: string;
+  secret?: string;
   filter?: (event: any) => boolean;
 }
 
@@ -76,7 +78,19 @@ class HorizonEventMonitor extends EventEmitter {
 
   private async deliverWebhook(sub: Subscription, event: any, attempt = 1) {
     try {
-      await axios.post(sub.webhookUrl, event);
+      const rawBody = JSON.stringify(event);
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const secret = sub.secret ?? process.env.HORIZON_WEBHOOK_SECRET;
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (secret) {
+        const sig = createHmac('sha256', secret)
+          .update(`${timestamp}.${rawBody}`)
+          .digest('hex');
+        headers['X-Stellar-Signature'] = `t=${timestamp},v1=${sig}`;
+      }
+      await axios.post(sub.webhookUrl, event, { headers });
     } catch (err) {
       if (attempt < 3) {
         setTimeout(() => this.deliverWebhook(sub, event, attempt + 1), 1000 * attempt);

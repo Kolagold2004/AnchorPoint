@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { RedisService } from '../../services/redis.service';
-import { getChallenge, getToken } from './auth.controller';
+import { getChallenge, getToken, refreshToken } from './auth.controller';
 import * as authService from '../../services/auth.service';
 import * as sep10Stellar from '../../utils/sep10-stellar';
 
@@ -50,6 +50,7 @@ describe('Auth Controller', () => {
       (authService.generateChallenge as jest.Mock).mockReturnValue('test-challenge');
       (authService.storeChallenge as jest.Mock).mockResolvedValue(undefined);
       (authService.generateSep10ChallengeTransaction as jest.Mock).mockReturnValue({
+        challenge: 'nonce-value',
         transactionXdr: 'test-challenge',
         networkPassphrase: 'Test SDF Network ; September 2015',
       });
@@ -61,6 +62,11 @@ describe('Auth Controller', () => {
         mockRedisService,
         'GBAD_PUBLIC_KEY',
         'test-challenge'
+      );
+      expect(mockRedisService.setJSON).toHaveBeenCalledWith(
+        'sep10:nonce:nonce-value',
+        expect.objectContaining({ account: 'GBAD_PUBLIC_KEY' }),
+        300
       );
       expect(mockResponse.json).toHaveBeenCalledWith({
         transaction: 'test-challenge',
@@ -74,6 +80,7 @@ describe('Auth Controller', () => {
       (authService.generateChallenge as jest.Mock).mockReturnValue('test-challenge');
       (authService.storeChallenge as jest.Mock).mockResolvedValue(undefined);
       (authService.generateSep10ChallengeTransaction as jest.Mock).mockReturnValue({
+        challenge: 'nonce-value',
         transactionXdr: 'test-challenge',
         networkPassphrase: 'Test SDF Network ; September 2015',
       });
@@ -90,12 +97,18 @@ describe('Auth Controller', () => {
       expect(authService.generateSep10ChallengeTransaction).toHaveBeenCalledWith(
         'GBAD_PUBLIC_KEY',
         'GBAD_PUBLIC_KEY',
-        expect.anything()
+        'TESTNET',
+        undefined
       );
       expect(authService.storeSep10Challenge).toHaveBeenCalledWith(
         mockRedisService,
         'GBAD_PUBLIC_KEY',
         expect.objectContaining({ transactionXdr: 'test-challenge' })
+      );
+      expect(mockRedisService.setJSON).toHaveBeenCalledWith(
+        'sep10:nonce:nonce-value',
+        expect.objectContaining({ account: 'GBAD_PUBLIC_KEY' }),
+        300
       );
       expect(mockResponse.json).toHaveBeenCalledWith({
         transaction: 'test-challenge',
@@ -156,11 +169,17 @@ describe('Auth Controller', () => {
       (authService.getChallenge as jest.Mock).mockResolvedValue(mockChallenge);
       (authService.removeChallenge as jest.Mock).mockResolvedValue(undefined);
       (authService.signToken as jest.Mock).mockReturnValue('jwt-token');
+      (mockRedisService.getJSON as jest.Mock).mockResolvedValue({
+        account: 'GBAD_PUBLIC_KEY',
+        createdAt: Date.now()
+      });
       (sep10Stellar.extractAccountFromSep10Transaction as jest.Mock).mockReturnValue('GBAD_PUBLIC_KEY');
       (authService.verifySep10ChallengeTransaction as jest.Mock).mockReturnValue({ isValid: true });
 
       await getToken(mockRequest as Request, mockResponse as Response, mockRedisService as RedisService);
 
+      expect(mockRedisService.getJSON).toHaveBeenCalledWith('sep10:nonce:valid-challenge');
+      expect(mockRedisService.del).toHaveBeenCalledWith('sep10:nonce:valid-challenge');
       expect(authService.removeChallenge).toHaveBeenCalledWith(mockRedisService, 'GBAD_PUBLIC_KEY');
       expect(authService.signToken).toHaveBeenCalledWith('GBAD_PUBLIC_KEY');
       expect(mockResponse.json).toHaveBeenCalledWith({
@@ -168,6 +187,29 @@ describe('Auth Controller', () => {
         type: 'bearer',
         expires_in: 3600
       });
+    });
+
+    it('rejects replayed challenge when nonce was already consumed', async () => {
+      mockRequest.body = { transaction: 'valid-challenge' };
+      const mockChallenge = {
+        challenge: 'valid-challenge',
+        publicKey: 'GBAD_PUBLIC_KEY',
+        createdAt: Date.now()
+      };
+
+      (authService.getChallenge as jest.Mock).mockResolvedValue(mockChallenge);
+      (mockRedisService.getJSON as jest.Mock).mockResolvedValue(null);
+      (sep10Stellar.extractAccountFromSep10Transaction as jest.Mock).mockReturnValue('GBAD_PUBLIC_KEY');
+      (authService.verifySep10ChallengeTransaction as jest.Mock).mockReturnValue({ isValid: true });
+
+      await getToken(mockRequest as Request, mockResponse as Response, mockRedisService as RedisService);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({
+        error: 'Invalid or expired nonce'
+      });
+      expect(authService.removeChallenge).not.toHaveBeenCalled();
+      expect(authService.signToken).not.toHaveBeenCalled();
     });
 
     it('returns 500 when token generation fails', async () => {
@@ -182,6 +224,102 @@ describe('Auth Controller', () => {
       expect(mockResponse.status).toHaveBeenCalledWith(500);
       expect(mockResponse.json).toHaveBeenCalledWith({
         error: 'Failed to verify challenge'
+      });
+    });
+
+    it('returns access_token (15m) and refresh_token (7d) when issueTokenPair is resolved', async () => {
+      mockRequest.body = { transaction: 'valid-challenge' };
+      const mockChallenge = {
+        challenge: 'valid-challenge',
+        publicKey: 'GBAD_PUBLIC_KEY',
+        createdAt: Date.now()
+      };
+
+      (authService.getChallenge as jest.Mock).mockResolvedValue(mockChallenge);
+      (authService.removeChallenge as jest.Mock).mockResolvedValue(undefined);
+      (authService.issueTokenPair as jest.Mock).mockResolvedValue({
+        access_token: 'access-jwt-15m',
+        refresh_token: 'refresh-tok-7d',
+        expires_in: 900,
+        refresh_expires_in: 604800,
+        familyId: 'fam-1'
+      });
+      (mockRedisService.getJSON as jest.Mock).mockResolvedValue({
+        account: 'GBAD_PUBLIC_KEY',
+        createdAt: Date.now()
+      });
+      (sep10Stellar.extractAccountFromSep10Transaction as jest.Mock).mockReturnValue('GBAD_PUBLIC_KEY');
+      (authService.verifySep10ChallengeTransaction as jest.Mock).mockReturnValue({ isValid: true });
+
+      await getToken(mockRequest as Request, mockResponse as Response, mockRedisService as RedisService);
+
+      expect(authService.issueTokenPair).toHaveBeenCalledWith('GBAD_PUBLIC_KEY', mockRedisService);
+      expect(mockResponse.json).toHaveBeenCalledWith({
+        token: 'access-jwt-15m',
+        access_token: 'access-jwt-15m',
+        refresh_token: 'refresh-tok-7d',
+        type: 'bearer',
+        expires_in: 900,
+        refresh_expires_in: 604800
+      });
+    });
+  });
+
+  describe('refreshToken', () => {
+    it('returns 401 when refresh token is missing', async () => {
+      mockRequest.body = {};
+      mockRequest.headers = {};
+
+      await refreshToken(mockRequest as Request, mockResponse as Response, mockRedisService as RedisService);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(401);
+      expect(mockResponse.json).toHaveBeenCalledWith({
+        error: 'Missing or invalid refresh token'
+      });
+    });
+
+    it('rotates valid refresh_token and returns new access_token and refresh_token pair', async () => {
+      mockRequest.body = { refresh_token: 'valid-refresh-token' };
+      mockRequest.headers = {};
+
+      (authService.rotateRefreshToken as jest.Mock).mockResolvedValue({
+        access_token: 'new-access-jwt',
+        refresh_token: 'new-refresh-token',
+        expires_in: 900,
+        refresh_expires_in: 604800,
+        familyId: 'fam-1',
+        publicKey: 'GBAD_PUBLIC_KEY'
+      });
+
+      await refreshToken(mockRequest as Request, mockResponse as Response, mockRedisService as RedisService);
+
+      expect(authService.rotateRefreshToken).toHaveBeenCalledWith('valid-refresh-token', mockRedisService);
+      expect(mockResponse.json).toHaveBeenCalledWith({
+        token: 'new-access-jwt',
+        access_token: 'new-access-jwt',
+        refresh_token: 'new-refresh-token',
+        type: 'bearer',
+        expires_in: 900,
+        refresh_expires_in: 604800,
+        authLevel: undefined,
+        signers: undefined
+      });
+    });
+
+    it('returns 401 with REFRESH_TOKEN_REUSE code when reuse is detected', async () => {
+      mockRequest.body = { refresh_token: 'reused-refresh-token' };
+      mockRequest.headers = {};
+
+      const reuseErr = new Error('Refresh token reuse detected; session family invalidated');
+      reuseErr.name = 'RefreshTokenReuseError';
+      (authService.rotateRefreshToken as jest.Mock).mockRejectedValue(reuseErr);
+
+      await refreshToken(mockRequest as Request, mockResponse as Response, mockRedisService as RedisService);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(401);
+      expect(mockResponse.json).toHaveBeenCalledWith({
+        error: 'Refresh token reuse detected; session family invalidated',
+        code: 'REFRESH_TOKEN_REUSE'
       });
     });
   });

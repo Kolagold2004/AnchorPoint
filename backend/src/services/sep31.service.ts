@@ -37,6 +37,8 @@ export interface CreateTransactionInput {
   receiverInfo: Record<string, string>;
   callbackUrl?: string;
   userPublicKey?: string;
+  /** Optional SEP-38 quote ID. When supplied the quote must exist and not be expired. */
+  quoteId?: string;
 }
 
 export interface Sep31Transaction {
@@ -85,7 +87,7 @@ export class SEP31Service {
   async createTransaction(
     input: CreateTransactionInput,
   ): Promise<{ id: string; stellarAccountId: string }> {
-    const { assetCode, amount, senderInfo, receiverInfo, callbackUrl, userPublicKey } = input;
+    const { assetCode, amount, senderInfo, receiverInfo, callbackUrl, userPublicKey, quoteId } = input;
 
     // 1. Validate asset
     if (!isSep31AssetSupported(assetCode)) {
@@ -128,7 +130,61 @@ export class SEP31Service {
       );
     }
 
-    // 5. Persist
+    // 5. Quote expiry validation — enforce strict time window to protect
+    //    against FX volatility losses.
+    let quotePrice: string | null = null;
+    if (quoteId) {
+      const quote = await prisma.quote.findUnique({ where: { id: quoteId } });
+
+      if (!quote) {
+        throw new Error(`quote_not_found: quote ${quoteId} does not exist`);
+      }
+
+      const now = new Date();
+      if (
+        quote.status === "EXPIRED" ||
+        (quote.expiresAt && now > quote.expiresAt)
+      ) {
+        throw new Error(
+          `quote_expired: quote ${quoteId} expired at ${quote.expiresAt?.toISOString() ?? "unknown"}`,
+        );
+      }
+
+      if (quote.status === "EXECUTED") {
+        throw new Error(`quote_already_used: quote ${quoteId} has already been executed`);
+      }
+
+      // Lock the rate by atomically claiming the quote. The conditional update
+      // guards against the quote expiring or being used concurrently between
+      // the read above and this write.
+      const claimed = await prisma.quote.updateMany({
+        where: {
+          id: quoteId,
+          status: "PENDING",
+          OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+        },
+        data: { status: "EXECUTED" },
+      });
+
+      if (claimed.count === 0) {
+        throw new Error(`quote_expired: quote ${quoteId} is no longer available`);
+      }
+
+      quotePrice = quote.price;
+    }
+
+    // 6. Calculate dynamic fee using FeeService
+    let feeAmount: string | null = null;
+    try {
+      const { FeeService } = require('./fee.service');
+      const feeService = new FeeService();
+      const feeResult = feeService.calculateAssetFee(assetCode, numericAmount);
+      feeAmount = feeResult.feeAmount.toFixed(7);
+    } catch {
+      // Fee calculation is non-critical; proceed without fee
+    }
+
+    // 7. Persist
     const id = randomUUID();
 
     // We need a userId for the relation
@@ -148,12 +204,15 @@ export class SEP31Service {
         userId: systemUser.id,
         assetCode: assetCode.toUpperCase(),
         amount,
+        feeAmount,
         type: "SEP31",
         status: "pending_sender",
         sep31Status: "pending_sender",
         senderInfo: senderInfo as object,
         receiverInfo: receiverInfo as object,
         callbackUrl: callbackUrl ?? null,
+        quoteId: quoteId ?? null,
+        quotePrice,
       },
     });
 

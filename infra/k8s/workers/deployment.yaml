@@ -31,6 +31,8 @@ data:
   REQUEST_TIMEOUT_MS: "30000"
   # Metrics endpoint port for Prometheus scraping
   METRICS_PORT: "9464"
+  # Grace window for in-flight jobs on SIGTERM/SIGINT before they are re-queued
+  WORKER_SHUTDOWN_TIMEOUT_MS: "30000"
 
 # -----------------------------------------------------------------------------
 # Secret: Sensitive credentials for worker pods
@@ -106,6 +108,9 @@ spec:
     spec:
       # Restart policy - always restart containers on failure or completion
       restartPolicy: Always
+      # Time allowed between SIGTERM and SIGKILL - must exceed WORKER_SHUTDOWN_TIMEOUT_MS
+      # so in-flight jobs can finish or be re-queued before the pod is killed
+      terminationGracePeriodSeconds: 45
       # Containers define what will run in each pod
       containers:
         - name: worker

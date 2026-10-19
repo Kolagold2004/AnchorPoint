@@ -65,9 +65,12 @@ const batchService = new BatchPaymentService({
  *               timeoutInSeconds:
  *                 type: number
  *                 description: Transaction timeout in seconds (default: 300)
+ *               dry_run:
+ *                 type: boolean
+ *                 description: Validate the batch and estimate fees and total cost without submitting it
  *     responses:
  *       200:
- *         description: Batch payment successful
+ *         description: Batch payment successful (or dry-run result when dry_run is true)
  *         content:
  *           application/json:
  *             schema:
@@ -101,7 +104,7 @@ export const executeBatchPayments = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const { payments, sourceSecretKey, encryptedKey, keyId, baseFee, timeoutInSeconds } = req.body;
+    const { payments, sourceSecretKey, encryptedKey, keyId, baseFee, timeoutInSeconds, dry_run } = req.body;
 
     // Validate request body
     if (!payments || !Array.isArray(payments)) {
@@ -134,6 +137,28 @@ export const executeBatchPayments = async (
         error: 'Maximum 100 payments per batch',
         maxAllowed: 100,
         requested: payments.length,
+      });
+      return;
+    }
+
+    if (dry_run === true) {
+      logger.info(`Batch payment dry run: ${payments.length} operations`);
+
+      const dryRunResult = await batchService.executeBatch({
+        payments,
+        sourceSecretKey,
+        encryptedKey,
+        keyId,
+        baseFee,
+        timeoutInSeconds,
+        dryRun: true,
+      });
+
+      res.status(200).json({
+        success: true,
+        dry_run: true,
+        data: dryRunResult,
+        message: `Dry run validated ${dryRunResult.successfulOps}/${dryRunResult.totalOps} payments; no transaction was submitted`,
       });
       return;
     }

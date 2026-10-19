@@ -57,6 +57,10 @@ impl RevenueDistributor {
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::GovStakers, &gov_stakers);
         env.storage().instance().set(&DataKey::GovShareBps, &gov_share_bps);
+        env.events().publish(
+            (symbol_short!("dist_init"),),
+            (admin, treasury, gov_stakers, gov_share_bps),
+        );
     }
 
     /// Update distribution split (admin only).
@@ -69,6 +73,8 @@ impl RevenueDistributor {
             panic!("invalid share bps");
         }
         env.storage().instance().set(&DataKey::GovShareBps, &gov_share_bps);
+        env.events()
+            .publish((symbol_short!("shares"), admin), gov_share_bps);
     }
 
     /// Register a token for batched payout distribution (admin only).
@@ -89,8 +95,10 @@ impl RevenueDistributor {
             }
         }
 
-        tokens.push_back(token_addr);
+        tokens.push_back(token_addr.clone());
         env.storage().instance().set(&DataKey::PayoutTokens, &tokens);
+        env.events()
+            .publish((symbol_short!("token_reg"),), (admin, token_addr));
     }
 
     /// Set the maximum cumulative deposit cap (admin only).

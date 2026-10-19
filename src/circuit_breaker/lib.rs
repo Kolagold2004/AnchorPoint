@@ -6,8 +6,10 @@
 //! - Timelocked unpausing to prevent abuse
 //! - Autonomous triggers based on oracle price volatility
 //! - Governance and authorized-bot trigger support
+//! - Automatic 2-hour cooldown when rolling 1-hour volume spikes above a
+//!   configured multiple (default 300%) of the baseline hourly volume
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Symbol, Vec};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -25,6 +27,12 @@ const DEFAULT_VOLUME_THRESHOLD: i128 = 1_000_000;
 
 /// Rolling window duration in seconds (1 hour).
 const WINDOW_DURATION_SECONDS: u64 = 3_600;
+
+/// Default spike multiplier in basis points (300% of baseline = 30,000 bps).
+const DEFAULT_SPIKE_MULTIPLIER_BPS: i128 = 30_000;
+
+/// Duration of the automatic cooldown triggered by a volume spike (2 hours).
+const SPIKE_COOLDOWN_SECONDS: u64 = 7_200;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -45,6 +53,17 @@ pub enum DataKey {
     VolumeThreshold,
     /// Rolling window of volume entries: (ledger_timestamp, amount).
     VolumeWindow,
+    /// Cached boolean mirror of whether the breaker is currently engaged.
+    ///
+    /// Kept in sync with `PauseTier` on every state transition so integrators
+    /// can read a single cheap flag instead of matching on the tier enum.
+    IsPaused,
+    /// Expected (normal) volume per rolling hour; 0 disables spike detection.
+    VolumeBaseline,
+    /// Spike threshold as a multiple of the baseline, in basis points.
+    SpikeMultiplierBps,
+    /// Timestamp until which a spike-triggered cooldown halts all operations.
+    CooldownUntil,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -123,6 +142,7 @@ impl CircuitBreaker {
         env.storage()
             .instance()
             .set(&DataKey::PauseTier, &PauseTier::None);
+        env.storage().instance().set(&DataKey::IsPaused, &false);
         env.storage().instance().set(&DataKey::TimelockSeconds, &tl);
         env.storage().instance().set(&DataKey::VolatilityBps, &vbps);
         env.storage()
@@ -134,12 +154,18 @@ impl CircuitBreaker {
             .set(&DataKey::VolumeThreshold, &DEFAULT_VOLUME_THRESHOLD);
 
         let window: Vec<VolumeEntry> = Vec::new(&env);
-        env.storage().instance().set(&DataKey::VolumeWindow, &window);
+        env.storage()
+            .instance()
+            .set(&DataKey::VolumeWindow, &window);
 
         let bots: Vec<Address> = Vec::new(&env);
         env.storage()
             .instance()
             .set(&DataKey::AuthorizedBots, &bots);
+        env.events().publish(
+            (symbol_short!("cb_init"),),
+            (admin, oracle, tl, vbps),
+        );
     }
 
     // ── Bot management ────────────────────────────────────────────────────────
@@ -223,7 +249,7 @@ impl CircuitBreaker {
     ///
     /// Permissionless — anyone can call. Fetches the current price from the
     /// oracle, compares it to the stored reference price for `asset`, and trips
-    /// to `PauseTier::All` if the deviation exceeds `volatility_bps`.
+    /// to `PauseTier::SwapOnly` if the deviation exceeds `volatility_bps`.
     /// The reference price is updated on every call.
     pub fn oracle_trip(env: Env, caller: Address, asset: Address) {
         caller.require_auth();
@@ -241,59 +267,71 @@ impl CircuitBreaker {
             (asset.clone(),).into_val(&env),
         );
 
-        assert!(current_price > 0, "oracle returned non-positive price");
+        Self::check_price(&env, caller, asset, current_price);
+    }
+
+    /// Check a trusted oracle price against the stored per-asset reference.
+    /// The configured oracle must authorize the supplied price.
+    pub fn check_and_trip(env: Env, asset: Address, price: i128) -> bool {
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleContract)
+            .expect("oracle not configured");
+        oracle.require_auth();
+        Self::check_price(&env, oracle, asset, price)
+    }
+
+    fn check_price(env: &Env, caller: Address, asset: Address, price: i128) -> bool {
+        assert!(price > 0, "oracle returned non-positive price");
 
         let volatility_bps: i128 = env
             .storage()
             .instance()
             .get(&DataKey::VolatilityBps)
             .unwrap_or(DEFAULT_VOLATILITY_BPS);
-
-        let maybe_ref: Option<i128> = env
-            .storage()
-            .instance()
-            .get(&DataKey::ReferencePrice(asset.clone()));
-
-        // Always update reference price for the next observation window.
-        env.storage()
-            .instance()
-            .set(&DataKey::ReferencePrice(asset.clone()), &current_price);
+        let key = DataKey::ReferencePrice(asset.clone());
+        let maybe_ref: Option<i128> = env.storage().instance().get(&key);
+        env.storage().instance().set(&key, &price);
 
         let ref_price = match maybe_ref {
             None => {
-                // First observation — store and return without tripping.
                 env.events().publish(
                     (symbol_short!("cb"), symbol_short!("ref_set")),
-                    (asset, current_price),
+                    (asset, price),
                 );
-                return;
+                return false;
             }
-            Some(p) => p,
+            Some(reference) => reference,
         };
 
-        // deviation_bps = |current - ref| * 10_000 / ref
-        let diff = if current_price > ref_price {
-            current_price - ref_price
+        let diff = if price > ref_price {
+            price.checked_sub(ref_price).expect("price diff overflow")
         } else {
-            ref_price - current_price
+            ref_price.checked_sub(price).expect("price diff overflow")
         };
         let deviation_bps = diff
             .checked_mul(10_000)
             .expect("overflow in deviation calc")
             / ref_price;
 
-        if deviation_bps >= volatility_bps {
-            Self::apply_trip(&env, PauseTier::All, TriggerSource::Oracle, caller.clone());
-            // Topic: event name only; asset + deviation data in payload.
+        if deviation_bps > volatility_bps {
+            Self::apply_trip(env, PauseTier::SwapOnly, TriggerSource::Oracle, caller);
             env.events().publish(
-                (symbol_short!("cb"), symbol_short!("vol_trip")),
+                (Symbol::new(env, "CircuitBreakerTripped"),),
                 (asset.clone(), deviation_bps, volatility_bps),
             );
+            env.events().publish(
+                (symbol_short!("cb"), symbol_short!("vol_trip")),
+                (asset, deviation_bps, volatility_bps),
+            );
+            true
         } else {
             env.events().publish(
                 (symbol_short!("cb"), symbol_short!("vol_ok")),
-                (asset.clone(), deviation_bps, volatility_bps),
+                (asset, deviation_bps, volatility_bps),
             );
+            false
         }
     }
 
@@ -342,7 +380,9 @@ impl CircuitBreaker {
             amount,
         });
 
-        env.storage().instance().set(&DataKey::VolumeWindow, &pruned);
+        env.storage()
+            .instance()
+            .set(&DataKey::VolumeWindow, &pruned);
 
         env.events().publish(
             (symbol_short!("cb"), symbol_short!("vol_rec")),
@@ -351,12 +391,52 @@ impl CircuitBreaker {
 
         // Trip if threshold is exceeded.
         if total > threshold {
-            Self::apply_trip(&env, PauseTier::All, TriggerSource::Oracle, env.current_contract_address());
+            Self::apply_trip(
+                &env,
+                PauseTier::All,
+                TriggerSource::Oracle,
+                env.current_contract_address(),
+            );
             env.events().publish(
                 (symbol_short!("cb"), symbol_short!("vol_trp")),
                 (total, threshold),
             );
         }
+
+        Self::check_volume_spike(&env, now, total);
+    }
+
+    /// Set the expected volume per rolling hour used for spike detection
+    /// (admin only). Pass 0 to disable spike detection.
+    pub fn set_volume_baseline(env: Env, caller: Address, baseline: i128) {
+        caller.require_auth();
+        Self::assert_admin(&env, &caller);
+        assert!(baseline >= 0, "baseline must not be negative");
+        env.storage()
+            .instance()
+            .set(&DataKey::VolumeBaseline, &baseline);
+        env.events().publish(
+            (symbol_short!("cb"), symbol_short!("base_set")),
+            (caller, baseline),
+        );
+    }
+
+    /// Set the spike multiplier in basis points (admin only).
+    ///
+    /// A cooldown triggers when window volume exceeds
+    /// `baseline * multiplier_bps / 10_000`. Must be above 10,000 (100%) so
+    /// that ordinary baseline activity can never trigger it.
+    pub fn set_spike_multiplier_bps(env: Env, caller: Address, multiplier_bps: i128) {
+        caller.require_auth();
+        Self::assert_admin(&env, &caller);
+        assert!(multiplier_bps > 10_000, "multiplier must exceed 10000 bps");
+        env.storage()
+            .instance()
+            .set(&DataKey::SpikeMultiplierBps, &multiplier_bps);
+        env.events().publish(
+            (symbol_short!("cb"), symbol_short!("spk_set")),
+            (caller, multiplier_bps),
+        );
     }
 
     /// Update the volume threshold (admin only).
@@ -441,11 +521,60 @@ impl CircuitBreaker {
         env.storage().instance().set(&DataKey::PauseTier, &target);
         env.storage()
             .instance()
+            .set(&DataKey::IsPaused, &(target != PauseTier::None));
+        env.storage()
+            .instance()
             .set(&DataKey::UnpauseUnlocksAt, &0u64);
 
         env.events().publish(
             (symbol_short!("unpaused"), target),
             env.ledger().timestamp(),
+        );
+    }
+
+    /// Immediately resume protocol operations (admin only).
+    ///
+    /// This is the emergency counterpart to the timelocked
+    /// [`Self::initiate_unpause`] / [`Self::execute_unpause`] flow. The timelock
+    /// exists so a single compromised key cannot silently re-open the protocol
+    /// on a normal schedule; this escape hatch is deliberately restricted to the
+    /// admin and is intended for false-positive trips (e.g. an autonomous volume
+    /// or oracle trigger firing on benign activity) where waiting out the
+    /// timelock would itself be the outage.
+    ///
+    /// Clears any pending unpause so a stale scheduled transition cannot fire
+    /// afterwards and re-pause or re-tier the protocol unexpectedly. Also lifts
+    /// an active volume-spike cooldown.
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+
+        let current: PauseTier = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseTier)
+            .unwrap_or(PauseTier::None);
+
+        assert!(
+            current != PauseTier::None || Self::is_in_cooldown(env.clone()),
+            "protocol is not paused"
+        );
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseTier, &PauseTier::None);
+        env.storage().instance().set(&DataKey::IsPaused, &false);
+        env.storage().instance().set(&DataKey::CooldownUntil, &0u64);
+
+        // Drop any scheduled unpause so it cannot execute against stale state.
+        env.storage()
+            .instance()
+            .set(&DataKey::UnpauseUnlocksAt, &0u64);
+
+        // Topic: event name only; admin + timestamp in data.
+        env.events().publish(
+            (symbol_short!("cb"), symbol_short!("resumed")),
+            (admin, env.ledger().timestamp()),
         );
     }
 
@@ -508,8 +637,14 @@ impl CircuitBreaker {
 
     // ── Read-only helpers ─────────────────────────────────────────────────────
 
-    /// Returns the current pause tier.
+    /// Returns the effective pause tier.
+    ///
+    /// Reports `PauseTier::All` while a volume-spike cooldown is active,
+    /// otherwise the tier set by governance, bots or the oracle.
     pub fn get_pause_tier(env: Env) -> PauseTier {
+        if Self::is_in_cooldown(env.clone()) {
+            return PauseTier::All;
+        }
         env.storage()
             .instance()
             .get(&DataKey::PauseTier)
@@ -535,6 +670,45 @@ impl CircuitBreaker {
     /// Returns true if all operations are halted.
     pub fn is_all_paused(env: Env) -> bool {
         Self::get_pause_tier(env) == PauseTier::All
+    }
+
+    /// Returns true if the breaker is engaged at any tier or a volume-spike
+    /// cooldown is active.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::IsPaused)
+            .unwrap_or(false)
+            || Self::is_in_cooldown(env)
+    }
+
+    /// Returns true while a volume-spike cooldown is in effect.
+    pub fn is_in_cooldown(env: Env) -> bool {
+        env.ledger().timestamp() < Self::get_cooldown_until(env)
+    }
+
+    /// Returns the timestamp the current cooldown ends at (0 = never triggered).
+    pub fn get_cooldown_until(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CooldownUntil)
+            .unwrap_or(0)
+    }
+
+    /// Returns the baseline hourly volume used for spike detection.
+    pub fn get_volume_baseline(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::VolumeBaseline)
+            .unwrap_or(0)
+    }
+
+    /// Returns the spike multiplier in basis points.
+    pub fn get_spike_multiplier_bps(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SpikeMultiplierBps)
+            .unwrap_or(DEFAULT_SPIKE_MULTIPLIER_BPS)
     }
 
     /// Returns the timestamp when the pending unpause unlocks (0 = none pending).
@@ -640,9 +814,57 @@ impl CircuitBreaker {
         false
     }
 
+    /// Start or extend the 2-hour cooldown if `window_total` exceeds the
+    /// configured multiple of the baseline. No-op when no baseline is set.
+    fn check_volume_spike(env: &Env, now: u64, window_total: i128) {
+        let baseline = Self::get_volume_baseline(env.clone());
+        if baseline == 0 {
+            return;
+        }
+        let multiplier_bps = Self::get_spike_multiplier_bps(env.clone());
+        let spike_threshold = baseline
+            .checked_mul(multiplier_bps)
+            .expect("overflow in spike threshold")
+            / 10_000;
+
+        if window_total <= spike_threshold {
+            return;
+        }
+
+        let was_cooling_down = Self::is_in_cooldown(env.clone());
+        // Sustained spikes keep pushing the cooldown out; it never shrinks.
+        let until = now
+            .checked_add(SPIKE_COOLDOWN_SECONDS)
+            .expect("cooldown overflow")
+            .max(Self::get_cooldown_until(env.clone()));
+        env.storage()
+            .instance()
+            .set(&DataKey::CooldownUntil, &until);
+
+        if !was_cooling_down {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TripCount)
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::TripCount,
+                &count.checked_add(1).expect("trip count overflow"),
+            );
+        }
+
+        env.events().publish(
+            (symbol_short!("cb"), symbol_short!("cooldown")),
+            (window_total, spike_threshold, until),
+        );
+    }
+
     /// Core trip logic shared by all trigger paths.
     fn apply_trip(env: &Env, tier: PauseTier, source: TriggerSource, caller: Address) {
         env.storage().instance().set(&DataKey::PauseTier, &tier);
+        env.storage()
+            .instance()
+            .set(&DataKey::IsPaused, &(tier != PauseTier::None));
 
         let count: u32 = env
             .storage()
@@ -699,6 +921,30 @@ mod tests {
         c.initialize(&admin, &oracle, &3600u64, &500i128);
         // second call must panic
         c.initialize(&admin, &oracle, &3600u64, &500i128);
+    }
+
+    #[test]
+    fn test_check_and_trip_within_threshold_does_not_trip() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, c) = setup_cb(&env);
+        let asset = Address::generate(&env);
+
+        assert!(!c.check_and_trip(&asset, &100i128));
+        assert!(!c.check_and_trip(&asset, &104i128));
+        assert_eq!(c.get_pause_tier(), PauseTier::None);
+    }
+
+    #[test]
+    fn test_check_and_trip_above_threshold_trips_swap_only() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, c) = setup_cb(&env);
+        let asset = Address::generate(&env);
+
+        assert!(!c.check_and_trip(&asset, &100i128));
+        assert!(c.check_and_trip(&asset, &106i128));
+        assert_eq!(c.get_pause_tier(), PauseTier::SwapOnly);
     }
 
     // ── Tiered pausing ────────────────────────────────────────────────────────
@@ -1118,7 +1364,8 @@ mod tests {
         assert_eq!(c.get_window_volume(), 600_000);
 
         // Advance ledger past the 1-hour window
-        env.ledger().with_mut(|l| l.timestamp = WINDOW_DURATION_SECONDS + 1);
+        env.ledger()
+            .with_mut(|l| l.timestamp = WINDOW_DURATION_SECONDS + 1);
 
         // Record new volume — old entry should be pruned
         c.record_volume(&100_000i128);
@@ -1168,5 +1415,404 @@ mod tests {
         let c = CircuitBreakerClient::new(&env, &id);
         c.initialize(&admin, &oracle, &3600u64, &500i128);
         c.record_volume(&0i128);
+    }
+
+    // ── Emergency pause/resume toggle ─────────────────────────────────────────
+
+    fn setup_cb(env: &Env) -> (Address, CircuitBreakerClient<'static>) {
+        let admin = Address::generate(env);
+        let oracle = Address::generate(env);
+        let id = env.register(CircuitBreaker, ());
+        let c = CircuitBreakerClient::new(env, &id);
+        c.initialize(&admin, &oracle, &3600u64, &500i128);
+        (admin, c)
+    }
+
+    #[test]
+    fn test_is_paused_false_after_initialize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, c) = setup_cb(&env);
+        assert!(!c.is_paused());
+        assert_eq!(c.get_pause_tier(), PauseTier::None);
+    }
+
+    #[test]
+    fn test_trip_sets_is_paused_for_every_tier() {
+        for tier in [PauseTier::SwapOnly, PauseTier::WithdrawOnly, PauseTier::All] {
+            let env = Env::default();
+            env.mock_all_auths();
+            let (admin, c) = setup_cb(&env);
+
+            c.trip(&admin, &tier);
+            assert!(c.is_paused(), "is_paused must be true after tripping");
+            assert_eq!(c.get_pause_tier(), tier);
+
+            c.unpause(&admin);
+            assert!(!c.is_paused(), "is_paused must be false after unpause");
+            assert_eq!(c.get_pause_tier(), PauseTier::None);
+        }
+    }
+
+    #[test]
+    fn test_unpause_resumes_immediately_without_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, c) = setup_cb(&env);
+
+        c.trip(&admin, &PauseTier::All);
+        assert!(c.is_all_paused());
+
+        // No ledger advance: the emergency path must not wait for the timelock.
+        c.unpause(&admin);
+
+        assert_eq!(c.get_pause_tier(), PauseTier::None);
+        assert!(!c.is_paused());
+        assert!(!c.is_all_paused());
+        assert!(!c.is_swap_paused());
+        assert!(!c.is_withdraw_paused());
+    }
+
+    #[test]
+    fn test_unpause_clears_pending_timelocked_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, c) = setup_cb(&env);
+
+        c.trip(&admin, &PauseTier::All);
+        c.initiate_unpause(&admin, &PauseTier::SwapOnly);
+        assert!(c.get_unpause_unlock_time() > 0);
+
+        c.unpause(&admin);
+
+        // The scheduled transition must be dropped, not left armed.
+        assert_eq!(c.get_unpause_unlock_time(), 0);
+        assert_eq!(c.get_pause_tier(), PauseTier::None);
+        assert!(!c.is_paused());
+    }
+
+    #[test]
+    #[should_panic(expected = "no unpause pending")]
+    fn test_execute_unpause_after_emergency_unpause_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, c) = setup_cb(&env);
+
+        c.trip(&admin, &PauseTier::All);
+        c.initiate_unpause(&admin, &PauseTier::SwapOnly);
+        let unlock_time = c.get_unpause_unlock_time();
+
+        c.unpause(&admin);
+
+        env.ledger().with_mut(|l| l.timestamp = unlock_time + 1);
+        c.execute_unpause();
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol is not paused")]
+    fn test_unpause_when_not_paused_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, c) = setup_cb(&env);
+        c.unpause(&admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "caller is not admin")]
+    fn test_unpause_by_non_admin_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, c) = setup_cb(&env);
+        let rando = Address::generate(&env);
+
+        c.trip(&admin, &PauseTier::All);
+        c.unpause(&rando);
+    }
+
+    #[test]
+    #[should_panic(expected = "caller is not admin")]
+    fn test_unpause_by_bot_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, c) = setup_cb(&env);
+        let bot = Address::generate(&env);
+
+        c.add_bot(&admin, &bot);
+        c.trip(&bot, &PauseTier::All);
+
+        // A bot may trip the breaker but must not be able to resume it.
+        c.unpause(&bot);
+    }
+
+    #[test]
+    fn test_pause_unpause_cycle_is_repeatable() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, c) = setup_cb(&env);
+
+        for _ in 0..3 {
+            c.trip(&admin, &PauseTier::All);
+            assert!(c.is_paused());
+            c.unpause(&admin);
+            assert!(!c.is_paused());
+        }
+
+        // Each trip is still accounted for.
+        assert_eq!(c.get_trip_count(), 3);
+    }
+
+    #[test]
+    fn test_timelocked_unpause_to_lower_tier_keeps_is_paused_true() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, c) = setup_cb(&env);
+
+        c.trip(&admin, &PauseTier::All);
+        c.initiate_unpause(&admin, &PauseTier::SwapOnly);
+        let unlock_time = c.get_unpause_unlock_time();
+        env.ledger().with_mut(|l| l.timestamp = unlock_time + 1);
+        c.execute_unpause();
+
+        // Still paused, just at a narrower tier.
+        assert_eq!(c.get_pause_tier(), PauseTier::SwapOnly);
+        assert!(c.is_paused());
+        assert!(c.is_swap_paused());
+    }
+
+    #[test]
+    fn test_unpause_emits_resumed_event() {
+        use soroban_sdk::{testutils::Events, vec as svec};
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let id = env.register(CircuitBreaker, ());
+        let c = CircuitBreakerClient::new(&env, &id);
+        c.initialize(&admin, &oracle, &3600u64, &500i128);
+
+        c.trip(&admin, &PauseTier::All);
+        env.ledger().with_mut(|l| l.timestamp = 12_345);
+        c.unpause(&admin);
+
+        // `all()` reports the most recent invocation, i.e. the unpause call.
+        // Topics: (cb, resumed); data: (admin, timestamp).
+        assert_eq!(
+            env.events().all(),
+            svec![
+                &env,
+                (
+                    id.clone(),
+                    svec![
+                        &env,
+                        symbol_short!("cb").into_val(&env),
+                        symbol_short!("resumed").into_val(&env),
+                    ],
+                    (admin.clone(), 12_345u64).into_val(&env),
+                )
+            ]
+        );
+    }
+
+    // ── Volume spike detection & dynamic cooldown ─────────────────────────────
+
+    /// Circuit breaker with a 100,000 baseline, so the default 300% spike
+    /// threshold is 300,000 (well below the 1,000,000 absolute threshold).
+    fn setup_spike(env: &Env) -> (Address, CircuitBreakerClient<'static>) {
+        env.mock_all_auths();
+        let (admin, c) = setup_cb(env);
+        c.set_volume_baseline(&admin, &100_000i128);
+        env.ledger().with_mut(|l| l.timestamp = 10_000);
+        (admin, c)
+    }
+
+    #[test]
+    fn test_spike_defaults() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, c) = setup_cb(&env);
+
+        assert_eq!(c.get_volume_baseline(), 0);
+        assert_eq!(c.get_spike_multiplier_bps(), DEFAULT_SPIKE_MULTIPLIER_BPS);
+        assert_eq!(c.get_cooldown_until(), 0);
+        assert!(!c.is_in_cooldown());
+    }
+
+    #[test]
+    fn test_no_cooldown_without_baseline() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, c) = setup_cb(&env);
+
+        c.record_volume(&900_000i128);
+        assert!(!c.is_in_cooldown());
+        assert!(!c.is_paused());
+    }
+
+    #[test]
+    fn test_volume_at_spike_threshold_does_not_trigger_cooldown() {
+        let env = Env::default();
+        let (_, c) = setup_spike(&env);
+
+        c.record_volume(&300_000i128);
+        assert!(!c.is_in_cooldown());
+        assert!(!c.is_paused());
+        assert_eq!(c.get_pause_tier(), PauseTier::None);
+    }
+
+    #[test]
+    fn test_volume_spike_triggers_two_hour_cooldown() {
+        let env = Env::default();
+        let (_, c) = setup_spike(&env);
+
+        c.record_volume(&200_000i128);
+        assert!(!c.is_in_cooldown());
+
+        // Window total 300,001 > 300% of baseline.
+        c.record_volume(&100_001i128);
+        assert!(c.is_in_cooldown());
+        assert_eq!(c.get_cooldown_until(), 10_000 + SPIKE_COOLDOWN_SECONDS);
+        assert!(c.is_paused());
+        assert!(c.is_all_paused());
+        assert!(c.is_swap_paused());
+        assert!(c.is_withdraw_paused());
+        assert_eq!(c.get_pause_tier(), PauseTier::All);
+        assert_eq!(c.get_trip_count(), 1);
+    }
+
+    #[test]
+    fn test_cooldown_expires_automatically() {
+        let env = Env::default();
+        let (_, c) = setup_spike(&env);
+
+        c.record_volume(&400_000i128);
+        assert!(c.is_paused());
+
+        env.ledger()
+            .with_mut(|l| l.timestamp = 10_000 + SPIKE_COOLDOWN_SECONDS - 1);
+        assert!(c.is_paused());
+
+        env.ledger()
+            .with_mut(|l| l.timestamp = 10_000 + SPIKE_COOLDOWN_SECONDS);
+        assert!(!c.is_in_cooldown());
+        assert!(!c.is_paused());
+        assert_eq!(c.get_pause_tier(), PauseTier::None);
+    }
+
+    #[test]
+    fn test_sustained_spike_extends_cooldown() {
+        let env = Env::default();
+        let (_, c) = setup_spike(&env);
+
+        c.record_volume(&400_000i128);
+        assert_eq!(c.get_cooldown_until(), 10_000 + SPIKE_COOLDOWN_SECONDS);
+
+        // Still inside the same hourly window, volume keeps flowing.
+        env.ledger().with_mut(|l| l.timestamp = 11_000);
+        c.record_volume(&1i128);
+        assert_eq!(c.get_cooldown_until(), 11_000 + SPIKE_COOLDOWN_SECONDS);
+        // Extending an active cooldown is not a new trip.
+        assert_eq!(c.get_trip_count(), 1);
+    }
+
+    #[test]
+    fn test_spike_ages_out_of_window() {
+        let env = Env::default();
+        let (_, c) = setup_spike(&env);
+
+        c.record_volume(&250_000i128);
+        // An hour later the old entry is pruned, so no spike is detected.
+        env.ledger()
+            .with_mut(|l| l.timestamp = 10_000 + WINDOW_DURATION_SECONDS);
+        c.record_volume(&250_000i128);
+        assert_eq!(c.get_window_volume(), 250_000);
+        assert!(!c.is_in_cooldown());
+    }
+
+    #[test]
+    fn test_custom_spike_multiplier() {
+        let env = Env::default();
+        let (admin, c) = setup_spike(&env);
+
+        // 150% of baseline.
+        c.set_spike_multiplier_bps(&admin, &15_000i128);
+        assert_eq!(c.get_spike_multiplier_bps(), 15_000);
+
+        c.record_volume(&150_000i128);
+        assert!(!c.is_in_cooldown());
+        c.record_volume(&1i128);
+        assert!(c.is_in_cooldown());
+    }
+
+    #[test]
+    fn test_emergency_unpause_lifts_cooldown() {
+        let env = Env::default();
+        let (admin, c) = setup_spike(&env);
+
+        c.record_volume(&400_000i128);
+        assert!(c.is_paused());
+
+        c.unpause(&admin);
+        assert!(!c.is_in_cooldown());
+        assert!(!c.is_paused());
+        assert_eq!(c.get_cooldown_until(), 0);
+    }
+
+    #[test]
+    fn test_cooldown_does_not_clear_governance_trip() {
+        let env = Env::default();
+        let (admin, c) = setup_spike(&env);
+
+        c.trip(&admin, &PauseTier::SwapOnly);
+        c.record_volume(&400_000i128);
+        assert_eq!(c.get_pause_tier(), PauseTier::All);
+
+        env.ledger()
+            .with_mut(|l| l.timestamp = 10_000 + SPIKE_COOLDOWN_SECONDS);
+        // Governance tier remains once the cooldown lapses.
+        assert_eq!(c.get_pause_tier(), PauseTier::SwapOnly);
+        assert!(c.is_paused());
+    }
+
+    #[test]
+    fn test_disabling_baseline_stops_spike_detection() {
+        let env = Env::default();
+        let (admin, c) = setup_spike(&env);
+
+        c.set_volume_baseline(&admin, &0i128);
+        c.record_volume(&400_000i128);
+        assert!(!c.is_in_cooldown());
+    }
+
+    #[test]
+    #[should_panic(expected = "multiplier must exceed 10000 bps")]
+    fn test_spike_multiplier_at_or_below_baseline_panics() {
+        let env = Env::default();
+        let (admin, c) = setup_spike(&env);
+        c.set_spike_multiplier_bps(&admin, &10_000i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "baseline must not be negative")]
+    fn test_negative_baseline_panics() {
+        let env = Env::default();
+        let (admin, c) = setup_spike(&env);
+        c.set_volume_baseline(&admin, &-1i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "caller is not admin")]
+    fn test_set_volume_baseline_non_admin_panics() {
+        let env = Env::default();
+        let (_, c) = setup_spike(&env);
+        c.set_volume_baseline(&Address::generate(&env), &1i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "caller is not admin")]
+    fn test_set_spike_multiplier_non_admin_panics() {
+        let env = Env::default();
+        let (_, c) = setup_spike(&env);
+        c.set_spike_multiplier_bps(&Address::generate(&env), &20_000i128);
     }
 }

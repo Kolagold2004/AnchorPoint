@@ -80,6 +80,26 @@ describe('MetricsService', () => {
     expect(metrics).toContain('anchorpoint_api_version_info');
   });
 
+  it('should expose database connection pool gauges (#1008)', async () => {
+    metricsService.setDbConnectionsLimit(20);
+    metricsService.setDbConnectionsActive(12);
+
+    const metrics = await metricsService.getMetrics();
+    expect(metrics).toContain('db_connections_limit');
+    expect(metrics).toContain('db_connections_active');
+    expect(metrics).toContain('pool="default"');
+  });
+
+  it('should expose the configured pool limit even before sampling (#1008)', async () => {
+    metricsService.setDbConnectionsLimit(20);
+    const metrics = await metricsService.getMetrics();
+    const limitLine = metrics
+      .split('\n')
+      .find((line) => line.startsWith('db_connections_limit'));
+    expect(limitLine).toBeDefined();
+    expect(limitLine).toMatch(/20$/);
+  });
+
   it('should reset all metrics', async () => {
     metricsService.incrementRequestCount('GET', '/test');
     metricsService.reset();
@@ -87,5 +107,40 @@ describe('MetricsService', () => {
     const metrics = await metricsService.getMetrics();
     // After reset, counters should be cleared
     expect(metrics).not.toContain('endpoint="/test"');
+  });
+});
+
+describe('MetricsService API latency & error metrics (#1202)', () => {
+  beforeEach(() => metricsService.reset());
+
+  it('exposes HTTP duration as a Prometheus histogram', async () => {
+    metricsService.observeRequestDuration('GET', '/sep6/info', 0.07);
+
+    const metrics = await metricsService.getMetrics();
+    expect(metrics).toContain('# TYPE http_request_duration_seconds histogram');
+    expect(metrics).toMatch(/http_request_duration_seconds_bucket\{le="0\.1",[^}]*method="GET",path="\/sep6\/info"[^}]*\} 1/);
+    expect(metrics).toMatch(/http_request_duration_seconds_count\{[^}]*path="\/sep6\/info"[^}]*\} 1/);
+  });
+
+  it('counts 4xx and 5xx responses as errors', async () => {
+    metricsService.recordHttpRequest('GET', '/ok', 200);
+    metricsService.recordHttpRequest('GET', '/missing', 404);
+    metricsService.recordHttpRequest('POST', '/boom', 500);
+
+    const metrics = await metricsService.getMetrics();
+    expect(metrics).toContain('# TYPE anchorpoint_errors_total counter');
+    expect(metrics).toMatch(/anchorpoint_errors_total\{[^}]*error_type="http_4xx",endpoint="\/missing"[^}]*\} 1/);
+    expect(metrics).toMatch(/anchorpoint_errors_total\{[^}]*error_type="http_5xx",endpoint="\/boom"[^}]*\} 1/);
+    expect(metrics).not.toMatch(/anchorpoint_errors_total\{[^}]*endpoint="\/ok"/);
+  });
+
+  it('tracks active WebSocket connections as a gauge', async () => {
+    metricsService.incrementWebSocketConnections();
+    metricsService.incrementWebSocketConnections();
+    metricsService.decrementWebSocketConnections();
+
+    const metrics = await metricsService.getMetrics();
+    expect(metrics).toContain('# TYPE websocket_active_connections gauge');
+    expect(metrics).toMatch(/websocket_active_connections\{[^}]*\} 1/);
   });
 });

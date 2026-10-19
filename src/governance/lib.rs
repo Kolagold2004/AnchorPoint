@@ -28,6 +28,8 @@ const MAX_TIMELOCK: u64 = 1_209_600;
 pub enum DataKey {
     /// Administrator address authorized to execute proposals
     Admin,
+    /// Pending new admin address awaiting acceptance (2-step transfer)
+    PendingAdmin,
     /// Token contract address for voting power
     TokenContract,
     /// Counter for proposal IDs
@@ -65,6 +67,8 @@ pub enum ProposalStatus {
     CLOSED,
     /// Proposal has been executed
     EXECUTED,
+    /// Proposal was cancelled by its creator before voting closed
+    CANCELLED,
 }
 
 /// Proposal structure with all governance data
@@ -145,6 +149,68 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .set(&DataKey::QuorumPercentage, &DEFAULT_QUORUM_PERCENTAGE);
+        env.events()
+            .publish((symbol_short!("gov_init"),), (admin, token_contract));
+    }
+
+    /// Step 1 of 2-step admin transfer: current admin proposes a new admin.
+    ///
+    /// The new admin is stored as a pending candidate. No ownership change occurs
+    /// until `claim_admin_role` is called by the pending admin.
+    ///
+    /// # Arguments
+    /// * `env`       – The environment
+    /// * `new_admin` – Address being nominated as the next admin
+    ///
+    /// # Panics
+    /// Panics if the caller is not the current admin.
+    pub fn propose_new_admin(env: Env, new_admin: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("prop_adm")),
+            (admin, new_admin),
+        );
+    }
+
+    /// Step 2 of 2-step admin transfer: pending admin accepts and claims the role.
+    ///
+    /// The pending admin must call this function and provide their own authorization.
+    /// Once accepted, the new admin is stored and the pending slot is cleared.
+    ///
+    /// # Panics
+    /// Panics if there is no pending admin proposal, or if the caller is not the
+    /// pending admin.
+    pub fn claim_admin_role(env: Env, new_admin: Address) {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .expect("no pending admin");
+
+        assert!(new_admin == pending, "caller is not the pending admin");
+        new_admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdmin);
+
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("new_adm")),
+            new_admin,
+        );
     }
 
     /// Allocate voting credits to a user
@@ -338,6 +404,29 @@ impl GovernanceContract {
             .publish((symbol_short!("created"), new_id), (creator, title));
 
         new_id
+    }
+
+    /// Cancel a pending proposal. Only its creator may cancel it before voting ends.
+    pub fn cancel_proposal(env: Env, creator: Address, proposal_id: u32) {
+        creator.require_auth();
+
+        let mut proposal: Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("proposal not found");
+        assert!(proposal.creator == creator, "only proposal creator can cancel");
+        assert!(proposal.status == ProposalStatus::OPEN, "proposal is not pending");
+        assert!(env.ledger().timestamp() < proposal.deadline, "voting period has ended");
+
+        proposal.status = ProposalStatus::CANCELLED;
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "ProposalCancelled"), proposal_id),
+            creator,
+        );
     }
 
     /// Vote on a proposal using quadratic voting
@@ -866,6 +955,78 @@ mod tests {
     }
 
     #[test]
+    fn test_creator_can_cancel_pending_proposal() {
+        let (env, _, _) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let creator = Address::generate(&env);
+        let proposal_id = client.create_proposal(
+            &creator,
+            &String::from_str(&env, "Test Proposal"),
+            &String::from_str(&env, "A proposal for testing"),
+            &86400u64,
+        );
+
+        client.cancel_proposal(&creator, &proposal_id);
+
+        assert_eq!(client.get_proposal(&proposal_id).status, ProposalStatus::CANCELLED);
+    }
+
+    #[test]
+    #[should_panic(expected = "only proposal creator can cancel")]
+    fn test_non_creator_cannot_cancel_proposal() {
+        let (env, _, _) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let creator = Address::generate(&env);
+        let proposal_id = client.create_proposal(
+            &creator,
+            &String::from_str(&env, "Test Proposal"),
+            &String::from_str(&env, "A proposal for testing"),
+            &86400u64,
+        );
+
+        client.cancel_proposal(&Address::generate(&env), &proposal_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "proposal is not open")]
+    fn test_cancelled_proposal_cannot_be_voted_on() {
+        let (env, _, _) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let creator = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = client.create_proposal(
+            &creator,
+            &String::from_str(&env, "Test Proposal"),
+            &String::from_str(&env, "A proposal for testing"),
+            &86400u64,
+        );
+
+        client.cancel_proposal(&creator, &proposal_id);
+        client.vote(&voter, &proposal_id, &true, &1i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "proposal must be closed before execution")]
+    fn test_cancelled_proposal_cannot_be_executed() {
+        let (env, _, _) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let creator = Address::generate(&env);
+        let proposal_id = client.create_proposal(
+            &creator,
+            &String::from_str(&env, "Test Proposal"),
+            &String::from_str(&env, "A proposal for testing"),
+            &86400u64,
+        );
+
+        client.cancel_proposal(&creator, &proposal_id);
+        client.execute_proposal(&creator, &proposal_id);
+    }
+
+    #[test]
     #[should_panic(expected = "HostError: Error(Contract, #1)")]
     fn test_create_proposal_timelock_too_short() {
         let (env, _, _) = setup();
@@ -991,6 +1152,80 @@ mod tests {
 
         // Try to cast 11 votes (cost = 121, but only have 100 credits)
         client.vote(&voter, &proposal_id, &true, &11i128);
+    }
+
+    #[test]
+    fn test_propose_and_claim_admin() {
+        let (env, admin, _token) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let token_contract = env.register(MockToken, ());
+        client.initialize(&admin, &token_contract);
+
+        let new_admin = Address::generate(&env);
+
+        // Step 1: current admin proposes a new admin
+        client.propose_new_admin(&new_admin);
+
+        // Step 2: new admin claims the role
+        client.claim_admin_role(&new_admin);
+
+        // New admin should now be able to allocate credits (admin-only action)
+        let user = Address::generate(&env);
+        client.allocate_credits(&new_admin, &user, &100);
+        assert_eq!(client.get_credits(&user), 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "no pending admin")]
+    fn test_claim_admin_without_proposal_panics() {
+        let (env, admin, _token) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let token_contract = env.register(MockToken, ());
+        client.initialize(&admin, &token_contract);
+
+        let new_admin = Address::generate(&env);
+        // No proposal made, claiming should panic
+        client.claim_admin_role(&new_admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "caller is not the pending admin")]
+    fn test_claim_admin_wrong_address_panics() {
+        let (env, admin, _token) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let token_contract = env.register(MockToken, ());
+        client.initialize(&admin, &token_contract);
+
+        let new_admin = Address::generate(&env);
+        let impersonator = Address::generate(&env);
+
+        // Propose new_admin but try to claim with a different address
+        client.propose_new_admin(&new_admin);
+        client.claim_admin_role(&impersonator);
+    }
+
+    #[test]
+    fn test_old_admin_loses_access_after_transfer() {
+        let (env, admin, _token) = setup();
+        let id = env.register(GovernanceContract, ());
+        let client = GovernanceContractClient::new(&env, &id);
+        let token_contract = env.register(MockToken, ());
+        client.initialize(&admin, &token_contract);
+
+        let new_admin = Address::generate(&env);
+        client.propose_new_admin(&new_admin);
+        client.claim_admin_role(&new_admin);
+
+        // Old admin should no longer be able to allocate credits
+        let user = Address::generate(&env);
+        // This should panic because admin is no longer the admin
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.allocate_credits(&admin, &user, &100);
+        }));
+        assert!(result.is_err(), "old admin should no longer have access");
     }
 }
 

@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env,
+    Symbol,
 };
 
 #[contracttype]
@@ -25,6 +26,10 @@ impl KycVerifier {
         env.storage()
             .instance()
             .set(&DataKey::VerifierPubKey, &verifier_pubkey);
+        env.events().publish(
+            (Symbol::new(&env, "VerifierInitialized"),),
+            (admin, verifier_pubkey),
+        );
     }
 
     pub fn set_kyc_status(env: Env, user: Address, signature: BytesN<64>, expires_at: u64) {
@@ -72,11 +77,24 @@ impl KycVerifier {
     }
 
     pub fn update_verifier(env: Env, new_pubkey: BytesN<32>) {
+        Self::rotate_verifier_key(env, new_pubkey);
+    }
+
+    pub fn rotate_verifier_key(env: Env, new_pubkey: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        let old_pubkey: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::VerifierPubKey)
+            .unwrap();
         env.storage()
             .instance()
             .set(&DataKey::VerifierPubKey, &new_pubkey);
+        env.events().publish(
+            (Symbol::new(&env, "VerifierKeyRotated"),),
+            (old_pubkey, new_pubkey),
+        );
     }
 
     pub fn revoke_kyc(env: Env, user: Address) {

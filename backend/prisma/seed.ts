@@ -9,11 +9,12 @@ async function main() {
   const adminEmail = 'admin@anchorpoint.io';
   const adminUser = await prisma.adminUser.upsert({
     where: { email: adminEmail },
-    update: {},
+    update: { role: 'SUPER_ADMIN' },
     create: {
       email: adminEmail,
       // Hashed representation for 'AdminPassword123!'
       passwordHash: '$2b$10$EpRvmqqYp86C45/./.e0zO5mJg0/xNq345W2e7V2x/wV8O2e8m',
+      role: 'SUPER_ADMIN',
     },
   });
   console.log(`✅ Seeded admin account: ${adminUser.email}`);

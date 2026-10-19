@@ -1,10 +1,61 @@
-import { rateLimit } from 'express-rate-limit';
+import { rateLimit, MemoryStore, Store } from 'express-rate-limit';
 import RedisStore from 'rate-limit-redis';
 import { redis } from '../../lib/redis';
 import logger from '../../utils/logger';
 import { Request, Response, NextFunction } from 'express';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { config } from '../../config/env';
+
+/**
+ * Wraps a Redis-backed store and transparently falls back to an in-memory
+ * store for any call whose Redis command throws (e.g. Redis is unreachable),
+ * so rate limiting keeps working — per-instance rather than shared across
+ * processes — instead of the request failing outright during an outage.
+ */
+export class RedisWithMemoryFallbackStore implements Store {
+  constructor(
+    private redisStore: RedisStore,
+    private memoryStore: MemoryStore = new MemoryStore(),
+  ) {}
+
+  init(options: Parameters<NonNullable<Store['init']>>[0]): void {
+    this.redisStore.init?.(options);
+    this.memoryStore.init?.(options);
+  }
+
+  async increment(key: string) {
+    try {
+      return await this.redisStore.increment(key);
+    } catch (error) {
+      logger.warn('Rate limiter Redis store failed, falling back to in-memory store', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      return this.memoryStore.increment(key);
+    }
+  }
+
+  async decrement(key: string): Promise<void> {
+    try {
+      await this.redisStore.decrement(key);
+    } catch (error) {
+      logger.warn('Rate limiter Redis store failed, falling back to in-memory store', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      await this.memoryStore.decrement(key);
+    }
+  }
+
+  async resetKey(key: string): Promise<void> {
+    try {
+      await this.redisStore.resetKey(key);
+    } catch (error) {
+      logger.warn('Rate limiter Redis store failed, falling back to in-memory store', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      await this.memoryStore.resetKey(key);
+    }
+  }
+}
 
 const HEALTH_SKIP_PATHS = ['/health', '/api-docs', '/api-docs.json'];
 
@@ -40,6 +91,10 @@ export interface RateLimitOptions {
   skipPaths?: string[];
   /** Tier limit map for dynamic rate limiting */
   tierLimits?: Record<string, { windowMs: number; max: number }>;
+  /** Emit RateLimit-* headers (IETF draft). Defaults to true. */
+  standardHeaders?: boolean;
+  /** Emit X-RateLimit-* headers. Defaults to false. */
+  legacyHeaders?: boolean;
 }
 
 function resolveMax(max: number | ((req: Request) => number) | undefined, req: Request): number {
@@ -74,6 +129,8 @@ export const createRateLimiter = (options: RateLimitOptions = {}) => {
     keyPrefix = 'rl:',
     skipPaths = [],
     tierLimits,
+    standardHeaders = true,
+    legacyHeaders = false,
   } = options;
 
   const allSkipPaths = [...HEALTH_SKIP_PATHS, ...skipPaths];
@@ -94,13 +151,15 @@ export const createRateLimiter = (options: RateLimitOptions = {}) => {
     windowMs: effectiveWindowMs,
     max: effectiveMax,
     message: { error: message },
-    standardHeaders: true,
-    legacyHeaders: false,
+    standardHeaders,
+    legacyHeaders,
     skip: (req: Request) => allSkipPaths.some(p => req.path === p || req.path.startsWith(p)),
-    store: new RedisStore({
-      sendCommand: (...args: string[]) => redis.call(...args),
-      prefix: keyPrefix,
-    }),
+    store: new RedisWithMemoryFallbackStore(
+      new RedisStore({
+        sendCommand: (...args: string[]) => (redis as any).call(...args),
+        prefix: keyPrefix,
+      }),
+    ),
 
     handler: (req: Request, res: Response, _next: NextFunction, options: any) => {
       logger.warn(`Rate limit exceeded`, { ip: req.ip, path: req.path, keyPrefix });
@@ -134,6 +193,14 @@ export const authLimiter = createRateLimiter({
   max: 10,
   message: 'Too many authentication attempts, please try again after 10 minutes.',
   keyPrefix: 'rl:auth:',
+});
+
+export const sep10ChallengeLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: 'Too many challenge requests, please try again later.',
+  keyPrefix: 'rl:sep10:challenge:',
+  legacyHeaders: true,
 });
 
 export const sensitiveApiLimiter = createRateLimiter({
@@ -175,10 +242,12 @@ export const submissionLimiterOptions = {
   message: { error: 'Rate limit exceeded for this Stellar account. Please try again later.' },
   standardHeaders: true,
   legacyHeaders: false,
-  store: new RedisStore({
-    sendCommand: (...args: string[]) => redis.call(...args),
-    prefix: 'rl:submit:',
-  }),
+  store: new RedisWithMemoryFallbackStore(
+    new RedisStore({
+      sendCommand: (...args: string[]) => (redis as any).call(...args),
+      prefix: 'rl:submit:',
+    }),
+  ),
   keyGenerator: (req: Request) => {
     try {
       if (req.body && req.body.xdr) {

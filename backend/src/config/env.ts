@@ -41,6 +41,7 @@ const envSchema = z.object({
   INTERACTIVE_URL: z.string().url().default('http://localhost:3000'),
   WEBHOOK_URL: z.string().url().optional(),
   WEBHOOK_SECRET: z.string().min(1, 'WEBHOOK_SECRET cannot be empty').optional(),
+  HORIZON_WEBHOOK_SECRET: z.string().min(1, 'HORIZON_WEBHOOK_SECRET cannot be empty').optional(),
   WEBHOOK_TIMEOUT_MS: z
     .string()
     .default('5000')
@@ -185,6 +186,11 @@ const envSchema = z.object({
     .default('30')
     .transform((val: string) => parseInt(val, 10))
     .pipe(z.number().int().min(0).max(300)),
+  SEP38_ASSETS_CACHE_TTL_SECONDS: z
+    .string()
+    .default('3600')
+    .transform((val: string) => parseInt(val, 10))
+    .pipe(z.number().int().min(60).max(86400)),
   UPLOAD_URL_EXPIRY_SECONDS: z
     .string()
     .default('900')
@@ -229,6 +235,7 @@ const SENSITIVE_CONFIG_KEYS = [
   'STELLAR_FEE_BUMP_SECRET',
   'RELAYER_SECRET_KEY',
   'WEBHOOK_SECRET',
+  'HORIZON_WEBHOOK_SECRET',
   'SIGNING_KEY',
 ] as const;
 

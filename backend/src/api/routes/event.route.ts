@@ -1,6 +1,7 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { eventController } from '../controllers/event.controller';
 import { webhookSignatureMiddleware } from '../middleware/auth.middleware';
+import { horizonWebhookMiddleware } from '../middleware/horizon-webhook.middleware';
 import logger from '../../utils/logger';
 
 const router = Router();
@@ -80,12 +81,22 @@ router.get('/', eventController.getEvents);
  */
 router.get('/health', eventController.getHealth);
 
-router.post('/webhook', webhookSignatureMiddleware, async (req, res) => {
+router.post('/webhook', webhookSignatureMiddleware, async (req: Request, res: Response) => {
   try {
     logger.info('Received webhook callback', { body: req.body });
     res.status(200).json({ received: true });
   } catch (error) {
     logger.error('Webhook processing failed', { error: error instanceof Error ? error.message : 'Unknown error' });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/horizon', horizonWebhookMiddleware, async (req: Request, res: Response) => {
+  try {
+    logger.info('Received Horizon webhook callback', { body: req.body });
+    res.status(200).json({ received: true });
+  } catch (error) {
+    logger.error('Horizon webhook processing failed', { error: error instanceof Error ? error.message : 'Unknown error' });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

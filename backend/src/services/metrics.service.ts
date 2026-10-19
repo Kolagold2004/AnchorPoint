@@ -6,11 +6,19 @@ export class MetricsService {
   private httpRequestDuration: Histogram<string>;
   private httpRequestsTotal: Counter<string>;
   private activeConnections: Gauge<string>;
+  private activeWebSockets: Gauge<string>;
   private errorCounter: Counter<string>;
   private dbQueryDuration: Histogram<string>;
   private apiVersionGauge: Gauge<string>;
   private sep38QuoteRequests: Counter<string>;
   private sep38QuoteDuration: Histogram<string>;
+  private dbConnectionsActive: Gauge<string>;
+  private dbConnectionsLimit: Gauge<string>;
+  private sepTransactionsTotal: Counter<string>;
+  private sepTransactionDuration: Histogram<string>;
+  private kycVerificationTotal: Counter<string>;
+  private transactionReconciliationTotal: Counter<string>;
+  private sepFlowDuration: Histogram<string>;
 
   constructor() {
     this.registry = new promClient.Registry();
@@ -45,7 +53,7 @@ export class MetricsService {
       name: 'http_request_duration_seconds',
       help: 'Duration of HTTP requests in seconds',
       labelNames: ['method', 'path'] as const,
-      buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10], // Response time buckets
+      buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10],
       registers: [this.registry],
     });
 
@@ -53,6 +61,13 @@ export class MetricsService {
     this.activeConnections = new promClient.Gauge({
       name: 'http_active_connections',
       help: 'Number of active HTTP connections',
+      registers: [this.registry],
+    });
+
+    // Gauge for active WebSocket (socket.io) connections
+    this.activeWebSockets = new promClient.Gauge({
+      name: 'websocket_active_connections',
+      help: 'Number of active WebSocket connections',
       registers: [this.registry],
     });
 
@@ -81,7 +96,6 @@ export class MetricsService {
       registers: [this.registry],
     });
 
-    // Set API version (assuming from package.json)
     this.apiVersionGauge.set({ version: '1.0.0' }, 1);
 
     // SEP-38 quote request counter
@@ -100,6 +114,97 @@ export class MetricsService {
       buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10],
       registers: [this.registry],
     });
+
+    // #1008: Database connection pool gauges. Consumed by the
+    // `DatabaseConnectionExhausted` Prometheus alert rule.
+    this.dbConnectionsActive = new promClient.Gauge({
+      name: 'db_connections_active',
+      help: 'Number of active database connections',
+      labelNames: ['pool'] as const,
+      registers: [this.registry],
+    });
+
+    this.dbConnectionsLimit = new promClient.Gauge({
+      name: 'db_connections_limit',
+      help: 'Maximum number of database connections in the pool',
+      labelNames: ['pool'] as const,
+      registers: [this.registry],
+    });
+
+    // SEP Transaction Volume & Latency Metrics (Issue #917)
+    this.sepTransactionsTotal = new promClient.Counter({
+      name: 'anchor_sep_transactions_total',
+      help: 'Total number of SEP protocol transactions by SEP type, asset, and status',
+      labelNames: ['sep', 'asset_code', 'status'] as const,
+      registers: [this.registry],
+    });
+
+    this.sepTransactionDuration = new promClient.Histogram({
+      name: 'anchor_sep_transaction_duration_seconds',
+      help: 'Duration of SEP transaction processing in seconds',
+      labelNames: ['sep', 'operation'] as const,
+      buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+      registers: [this.registry],
+    });
+
+    this.kycVerificationTotal = new promClient.Counter({
+      name: 'anchor_kyc_verification_total',
+      help: 'Total number of KYC verifications processed',
+      labelNames: ['status', 'provider'] as const,
+      registers: [this.registry],
+    });
+
+    // #1342: Outcomes of the pending_stellar transaction reconciliation job
+    this.transactionReconciliationTotal = new promClient.Counter({
+      name: 'transaction_reconciliation_total',
+      help: 'Total number of transaction status reconciliations by outcome',
+      labelNames: ['outcome'] as const,
+      registers: [this.registry],
+    });
+
+    // #1330: Per-SEP flow latency for SLA monitoring (SEP-6, SEP-10, SEP-24, SEP-31)
+    this.sepFlowDuration = new promClient.Histogram({
+      name: 'sep_flow_duration_seconds',
+      help: 'Duration of SEP flow requests in seconds by SEP, operation, and status',
+      labelNames: ['sep', 'operation', 'status'] as const,
+      buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+      registers: [this.registry],
+    });
+  }
+
+  /**
+   * Record SEP transaction event
+   */
+  incrementSepTransaction(sep: string, assetCode: string, status: string): void {
+    this.sepTransactionsTotal.inc({ sep, asset_code: assetCode, status });
+  }
+
+  /**
+   * Observe SEP transaction duration
+   */
+  observeSepTransactionDuration(sep: string, operation: string, durationSeconds: number): void {
+    this.sepTransactionDuration.observe({ sep, operation }, durationSeconds);
+  }
+
+  /**
+   * Record KYC verification result
+   */
+  incrementKycVerification(status: string, provider: string = 'internal'): void {
+    this.kycVerificationTotal.inc({ status, provider });
+  }
+
+  /**
+   * #1342: Record a transaction reconciliation outcome
+   */
+  incrementTransactionReconciliation(outcome: string): void {
+    this.transactionReconciliationTotal.inc({ outcome });
+  }
+
+  /**
+   * #1330: Observe the duration of a SEP flow request
+   */
+  observeSepFlowDuration(sep: string, operation: string, status: string, durationSeconds: number): void {
+    this.sepFlowDuration.observe({ sep, operation, status }, durationSeconds);
   }
 
   /**
@@ -118,6 +223,9 @@ export class MetricsService {
     statusCode: number
   ): void {
     this.httpRequestsTotal.inc({ method, path, status_code: statusCode });
+    if (statusCode >= 400) {
+      this.incrementError(statusCode >= 500 ? 'http_5xx' : 'http_4xx', path);
+    }
   }
 
   /**
@@ -132,6 +240,17 @@ export class MetricsService {
    */
   setActiveConnections(count: number): void {
     this.activeConnections.set(count);
+  }
+
+  /**
+   * Track a WebSocket connection opening (+1) or closing (-1)
+   */
+  incrementWebSocketConnections(): void {
+    this.activeWebSockets.inc();
+  }
+
+  decrementWebSocketConnections(): void {
+    this.activeWebSockets.dec();
   }
 
   /**
@@ -156,10 +275,24 @@ export class MetricsService {
   }
 
   /**
-   * Observe SEP-38 quote request duration
+   * Observe SEP-38 quote duration
    */
   observeSep38QuoteDuration(status: string, durationSeconds: number): void {
     this.sep38QuoteDuration.observe({ status }, durationSeconds);
+  }
+
+  /**
+   * #1008: Set the number of active database connections for the given pool.
+   */
+  setDbConnectionsActive(count: number, pool = 'default'): void {
+    this.dbConnectionsActive.set({ pool }, count);
+  }
+
+  /**
+   * #1008: Set the configured maximum size of the database connection pool.
+   */
+  setDbConnectionsLimit(limit: number, pool = 'default'): void {
+    this.dbConnectionsLimit.set({ pool }, limit);
   }
 
   /**

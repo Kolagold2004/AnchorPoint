@@ -1,19 +1,34 @@
-import { createContext, useContext, useMemo, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import en from './locales/en.json';
 import es from './locales/es.json';
 import pt from './locales/pt.json';
+import fr from './locales/fr.json';
+import ar from './locales/ar.json';
+import he from './locales/he.json';
 
-type Language = 'en' | 'es' | 'pt';
-type TranslationContextValue = {
-  t: (key: string) => string;
+export type Language = 'en' | 'es' | 'pt' | 'fr' | 'ar' | 'he';
+export type Direction = 'ltr' | 'rtl';
+export type TranslateParams = Record<string, string | number>;
+
+export const RTL_LANGUAGES: Language[] = ['ar', 'he'];
+
+export const isRtlLanguage = (lang: Language): boolean => RTL_LANGUAGES.includes(lang);
+
+export type TranslationContextValue = {
+  t: (key: string, params?: TranslateParams) => string;
   language: Language;
   changeLanguage: (language: Language) => void;
+  direction: Direction;
+  isRtl: boolean;
 };
 
 const resources: Record<Language, Record<string, unknown>> = {
   en,
   es,
   pt,
+  fr,
+  ar,
+  he,
 };
 
 const getValue = (dictionary: Record<string, unknown>, key: string): string | undefined => {
@@ -31,20 +46,53 @@ const getValue = (dictionary: Record<string, unknown>, key: string): string | un
   return typeof current === 'string' ? current : undefined;
 };
 
+const interpolate = (template: string, params?: TranslateParams): string => {
+  if (!params) return template;
+  return template.replace(/\{\{(\w+)\}\}/g, (match, name: string) =>
+    name in params ? String(params[name]) : match,
+  );
+};
+
 const TranslationContext = createContext<TranslationContextValue>({
   t: (key: string) => key,
   language: 'en',
   changeLanguage: () => undefined,
+  direction: 'ltr',
+  isRtl: false,
 });
 
-export const I18nProvider = ({ children }: { children: ReactNode }) => {
-  const [language, setLanguage] = useState<Language>('en');
+export const I18nProvider = ({
+  children,
+  initialLanguage = 'en',
+}: {
+  children: ReactNode;
+  initialLanguage?: Language;
+}) => {
+  const [language, setLanguage] = useState<Language>(initialLanguage);
+
+  const isRtl = isRtlLanguage(language);
+  const direction: Direction = isRtl ? 'rtl' : 'ltr';
+
+  useEffect(() => {
+    if (typeof document !== 'undefined') {
+      document.documentElement.dir = direction;
+      document.documentElement.lang = language;
+      document.documentElement.setAttribute('data-direction', direction);
+    }
+  }, [direction, language]);
 
   const value = useMemo<TranslationContextValue>(() => ({
-    t: (key: string) => getValue(resources[language] as Record<string, unknown>, key) ?? key,
+    t: (key: string, params?: TranslateParams) => {
+      const activeDict = resources[language] as Record<string, unknown>;
+      const fallbackDict = resources.en as Record<string, unknown>;
+      const rawText = getValue(activeDict, key) ?? getValue(fallbackDict, key) ?? key;
+      return interpolate(rawText, params);
+    },
     language,
     changeLanguage: (nextLanguage: Language) => setLanguage(nextLanguage),
-  }), [language]);
+    direction,
+    isRtl,
+  }), [language, direction, isRtl]);
 
   return <TranslationContext.Provider value={value}>{children}</TranslationContext.Provider>;
 };

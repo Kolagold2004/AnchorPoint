@@ -4,6 +4,7 @@ use core::cmp;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, Env, Vec,
 };
+use ethnum::U256;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -103,6 +104,8 @@ pub enum DataKey {
     UserPositions(Address),
     // Volume tracker
     VolumeTracker,
+    // Sqrt price associated with an initialized tick
+    TickSqrtPrice(i32),
 }
 
 #[contract]
@@ -128,27 +131,40 @@ impl MultiAssetSwap {
         }
     }
 
-    /// Convert tick to sqrt price (simplified, monotonically increasing).
-    /// Returns sqrt(1.0001^tick) * 2^96 approximated for testing.
+    /// Convert a tick to sqrt(1.0001^tick) in Q96 fixed point.
     pub fn tick_to_sqrt_price_x96(tick: i32) -> u128 {
-        // Base price at tick 0: 2^96
-        // Each tick multiplies/divides by ~1.00005 (half-tick of 1.0001).
-        // We use integer approximation: price(tick) = 2^96 * 10000^abs(tick) / 10001^abs(tick)
-        // For simplicity, shift 2^96 by tick * small constant.
-        // Correct directional behavior: higher tick = higher price.
-        let base: u128 = 1u128 << 96; // price at tick 0
-        if tick == 0 {
-            return base;
+        const Q96: u128 = 1_u128 << 96;
+        const SQRT_1_0001_Q96: u128 = 79_232_123_823_359_799_118_286_999_567;
+
+        // This contract stores prices in u128, so values outside that range are
+        // saturated instead of overflowing during exponentiation.
+        if tick > 443_636 {
+            return u128::MAX;
         }
-        // Use a linear approximation: each tick changes price by 0.01% of 2^96
-        // This keeps the price monotonically correct for test purposes.
-        let tick_abs = tick.unsigned_abs() as u128;
-        let delta = base / 10000 * tick_abs; // 0.01% per tick step
-        if tick > 0 {
-            base.saturating_add(delta)
+        if tick < -443_636 {
+            return 0;
+        }
+
+        let scale = U256::from(Q96);
+        let mut exponent = tick.unsigned_abs();
+        let mut factor = if tick < 0 {
+            (scale * scale) / U256::from(SQRT_1_0001_Q96)
         } else {
-            base.saturating_sub(delta)
+            U256::from(SQRT_1_0001_Q96)
+        };
+        let mut ratio = scale;
+
+        while exponent > 0 {
+            if exponent & 1 == 1 {
+                ratio = (ratio * factor) / scale;
+            }
+            exponent >>= 1;
+            if exponent > 0 {
+                factor = (factor * factor) / scale;
+            }
         }
+
+        u128::try_from(ratio).unwrap_or(if tick < 0 { 0 } else { u128::MAX })
     }
 
     /// Simple power function for integer math
@@ -288,6 +304,57 @@ impl MultiAssetSwap {
             last_sqrt_price: sqrt_price_x96,
         });
         env.storage().instance().set(&DataKey::ReferralFeeRate, &100_u32); // 1% referral fee by default
+        env.events().publish(
+            (symbol_short!("pool_init"),),
+            (token_a, token_b, sqrt_price_x96, tick),
+        );
+    }
+
+    /// Initialize a tick with its canonical Q96 square-root price.
+    pub fn initialize_tick(env: Env, tick_index: i32, sqrt_price_x96: u128) {
+        assert!(tick_index >= MIN_TICK && tick_index <= MAX_TICK, "tick out of bounds");
+        assert!(tick_index % TICK_SPACING == 0, "invalid tick spacing");
+        assert!(sqrt_price_x96 > 0, "invalid sqrt price");
+        assert!(
+            sqrt_price_x96 == Self::tick_to_sqrt_price_x96(tick_index),
+            "sqrt price does not match tick"
+        );
+
+        let tick_key = DataKey::Tick(tick_index);
+        assert!(!env.storage().instance().has(&tick_key), "tick already initialized");
+        env.storage().instance().set(&tick_key, &Tick {
+            liquidity_gross: 0,
+            liquidity_net: 0,
+            fee_growth_outside_0x128: 0,
+            fee_growth_outside_1x128: 0,
+        });
+        env.storage()
+            .instance()
+            .set(&DataKey::TickSqrtPrice(tick_index), &sqrt_price_x96);
+    }
+
+    /// Return the canonical sqrt price for an initialized tick.
+    pub fn get_tick_sqrt_price(env: Env, tick_index: i32) -> u128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TickSqrtPrice(tick_index))
+            .expect("tick not initialized")
+    }
+
+    /// Compute the output of one concentrated-liquidity swap step.
+    pub fn compute_swap_step(
+        _env: Env,
+        sqrt_ratio_current: u128,
+        sqrt_ratio_target: u128,
+        liquidity: i128,
+        amount: i128,
+    ) -> i128 {
+        SwapMath::compute_swap_step(
+            sqrt_ratio_current,
+            sqrt_ratio_target,
+            liquidity,
+            amount,
+        )
     }
 
     /// Creates a new position with concentrated liquidity.
@@ -418,8 +485,15 @@ impl MultiAssetSwap {
         
         if tick_data.liquidity_gross == 0 {
             env.storage().instance().remove(&tick_key);
+            env.storage()
+                .instance()
+                .remove(&DataKey::TickSqrtPrice(tick));
         } else {
             env.storage().instance().set(&tick_key, &tick_data);
+            env.storage().instance().set(
+                &DataKey::TickSqrtPrice(tick),
+                &Self::tick_to_sqrt_price_x96(tick),
+            );
         }
     }
 
@@ -519,7 +593,7 @@ impl MultiAssetSwap {
         
         let mut current_sqrt_price_x96: u128 = env.storage().instance().get(&DataKey::CurrentSqrtPriceX96).expect("not initialized");
         let mut current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).expect("not initialized");
-        let mut current_liquidity: i128 = env.storage().instance().get(&DataKey::CurrentLiquidity).unwrap_or(0);
+        let current_liquidity: i128 = env.storage().instance().get(&DataKey::CurrentLiquidity).unwrap_or(0);
         
         // Calculate dynamic fee
         let fee_bps = Self::calculate_dynamic_fee(&env);
@@ -537,53 +611,38 @@ impl MultiAssetSwap {
         
         // Apply dynamic fee
         let amount_in_less_fee = amount_in * (FEE_DENOMINATOR - fee_bps) as i128 / FEE_DENOMINATOR as i128;
-        let mut amount_remaining = amount_in_less_fee;
-        let mut amount_out = 0_i128;
-        
-        while amount_remaining > 0 {
-            if current_liquidity == 0 {
-                panic!("insufficient liquidity");
-            }
-            
-            // Calculate output amount using current liquidity
-            let amount_calculated = if zero_for_one {
-                // token0 in, token1 out
-                let numerator = amount_remaining * current_sqrt_price_x96 as i128;
-                let denominator = (current_liquidity as u128 * (1u128 << 96)) + amount_remaining as u128;
-                numerator.checked_div(denominator as i128).unwrap_or(0)
-            } else {
-                // token1 in, token0 out
-                let numerator = amount_remaining * (1u128 << 96) as i128;
-                let denominator = current_liquidity as u128 * current_sqrt_price_x96;
-                numerator.checked_div(denominator as i128).unwrap_or(0)
-            };
-            
-            if amount_calculated == 0 {
-                break;
-            }
-            
-            let actual_amount = core::cmp::min(amount_calculated, amount_remaining);
-            amount_out += actual_amount;
-            amount_remaining -= actual_amount;
-            
-            // Update price (simplified)
-            if zero_for_one {
-                current_sqrt_price_x96 = current_sqrt_price_x96.checked_sub(1).unwrap_or(0);
-            } else {
-                current_sqrt_price_x96 = current_sqrt_price_x96.checked_add(1).unwrap_or(u128::MAX);
-            }
-            
-            // Check if we've hit the price limit
-            if (zero_for_one && current_sqrt_price_x96 <= sqrt_price_limit_x96) ||
-               (!zero_for_one && current_sqrt_price_x96 >= sqrt_price_limit_x96) {
-                break;
-            }
+        if current_liquidity == 0 {
+            panic!("insufficient liquidity");
+        }
+        let (next_sqrt_price, amount_out, amount_in_used) = SwapMath::compute_swap_step_values(
+            current_sqrt_price_x96,
+            sqrt_price_limit_x96,
+            current_liquidity,
+            amount_in_less_fee,
+        );
+        assert!(amount_out > 0, "zero amount out");
+        current_sqrt_price_x96 = next_sqrt_price;
+
+        let gross_amount_used = amount_in_used
+            .checked_mul(FEE_DENOMINATOR as i128)
+            .and_then(|value| {
+                value.checked_add((FEE_DENOMINATOR - fee_bps) as i128 - 1)
+            })
+            .expect("swap input overflow")
+            / (FEE_DENOMINATOR - fee_bps) as i128;
+        let unused_input = amount_in - gross_amount_used;
+        if unused_input > 0 {
+            token::Client::new(&env, &token_in).transfer(
+                &contract_addr,
+                &recipient,
+                &unused_input,
+            );
         }
         
         assert!(amount_out > 0, "zero amount out");
         
         // Update tracker with volume and price change
-        Self::update_tracker(&env, amount_in, current_sqrt_price_x96);
+        Self::update_tracker(&env, gross_amount_used, current_sqrt_price_x96);
         // Slippage protection: ensure amount_out meets minimum threshold
         if amount_out < min_amount_out {
             panic_with_error!(env, SwapError::SlippageExceeded);
@@ -594,7 +653,7 @@ impl MultiAssetSwap {
         env.storage().instance().set(&DataKey::CurrentLiquidity, &current_liquidity);
         
         // Update fee growth (simplified)
-        let fee_amount = amount_in - amount_in_less_fee;
+        let fee_amount = gross_amount_used - amount_in_used;
         
         // Handle referral fee: redirect portion of swap fee to referrer
         let referral_fee_rate: u32 = env.storage().instance().get(&DataKey::ReferralFeeRate).unwrap_or(100);
@@ -635,8 +694,8 @@ impl MultiAssetSwap {
             (symbol_short!("swap"), recipient.clone()),
             SwapEvent {
                 recipient,
-                amount_0: if zero_for_one { amount_in } else { -amount_out },
-                amount_1: if zero_for_one { -amount_out } else { amount_in },
+                amount_0: if zero_for_one { gross_amount_used } else { -amount_out },
+                amount_1: if zero_for_one { -amount_out } else { gross_amount_used },
                 sqrt_price_x96: current_sqrt_price_x96 as u64,
                 liquidity: current_liquidity,
                 tick: current_tick,
@@ -831,6 +890,142 @@ impl MultiAssetSwap {
 pub struct SwapMath;
 
 impl SwapMath {
+    const Q96: u128 = 1_u128 << 96;
+
+    fn div_rounding_up(numerator: U256, denominator: U256) -> U256 {
+        assert!(denominator != U256::from(0_u8), "division by zero");
+        let quotient = numerator / denominator;
+        if numerator % denominator == U256::from(0_u8) {
+            quotient
+        } else {
+            quotient + U256::from(1_u8)
+        }
+    }
+
+    fn amount0_delta(liquidity: i128, sqrt_a: u128, sqrt_b: u128, round_up: bool) -> U256 {
+        let diff = sqrt_a.abs_diff(sqrt_b);
+        let numerator = U256::from(liquidity as u128)
+            .checked_mul(U256::from(diff))
+            .and_then(|value| value.checked_mul(U256::from(Self::Q96)))
+            .expect("swap amount overflow");
+        let denominator = U256::from(sqrt_a)
+            .checked_mul(U256::from(sqrt_b))
+            .expect("swap amount overflow");
+        if round_up {
+            Self::div_rounding_up(numerator, denominator)
+        } else {
+            numerator / denominator
+        }
+    }
+
+    fn amount1_delta(liquidity: i128, sqrt_a: u128, sqrt_b: u128, round_up: bool) -> U256 {
+        let numerator = U256::from(liquidity as u128)
+            .checked_mul(U256::from(sqrt_a.abs_diff(sqrt_b)))
+            .expect("swap amount overflow");
+        let denominator = U256::from(Self::Q96);
+        if round_up {
+            Self::div_rounding_up(numerator, denominator)
+        } else {
+            numerator / denominator
+        }
+    }
+
+    fn as_amount(value: U256) -> i128 {
+        i128::try_from(value).expect("swap output overflow")
+    }
+
+    fn compute_swap_step_values(
+        sqrt_current: u128,
+        sqrt_target: u128,
+        liquidity: i128,
+        amount_remaining: i128,
+    ) -> (u128, i128, i128) {
+        if liquidity <= 0 || amount_remaining <= 0 || sqrt_current == 0 || sqrt_target == 0 {
+            return (sqrt_current, 0, 0);
+        }
+        if sqrt_current == sqrt_target {
+            return (sqrt_current, 0, 0);
+        }
+
+        let zero_for_one = sqrt_current > sqrt_target;
+        let amount_in_to_target = if zero_for_one {
+            Self::amount0_delta(liquidity, sqrt_target, sqrt_current, true)
+        } else {
+            Self::amount1_delta(liquidity, sqrt_current, sqrt_target, true)
+        };
+        let remaining = U256::from(amount_remaining as u128);
+        let reaches_target = remaining >= amount_in_to_target;
+
+        let next_sqrt = if reaches_target {
+            sqrt_target
+        } else if zero_for_one {
+            let liquidity_q96 = U256::from(liquidity as u128)
+                .checked_mul(U256::from(Self::Q96))
+                .expect("swap amount overflow");
+            let numerator = liquidity_q96
+                .checked_mul(U256::from(sqrt_current))
+                .expect("swap amount overflow");
+            let denominator = liquidity_q96
+                .checked_add(
+                    U256::from(amount_remaining as u128)
+                        .checked_mul(U256::from(sqrt_current))
+                        .expect("swap amount overflow"),
+                )
+                .expect("swap amount overflow");
+            let next = Self::div_rounding_up(numerator, denominator);
+            u128::try_from(next).expect("sqrt price overflow").max(sqrt_target)
+        } else {
+            let price_delta = U256::from(amount_remaining as u128)
+                .checked_mul(U256::from(Self::Q96))
+                .expect("swap amount overflow")
+                / U256::from(liquidity as u128);
+            let next = U256::from(sqrt_current)
+                .checked_add(price_delta)
+                .expect("sqrt price overflow");
+            u128::try_from(next)
+                .expect("sqrt price overflow")
+                .min(sqrt_target)
+        };
+
+        let amount_in = if reaches_target {
+            Self::as_amount(amount_in_to_target)
+        } else {
+            amount_remaining
+        };
+        let amount_out = if zero_for_one {
+            Self::as_amount(Self::amount1_delta(
+                liquidity,
+                next_sqrt,
+                sqrt_current,
+                false,
+            ))
+        } else {
+            Self::as_amount(Self::amount0_delta(
+                liquidity,
+                sqrt_current,
+                next_sqrt,
+                false,
+            ))
+        };
+
+        (next_sqrt, amount_out, amount_in)
+    }
+
+    pub fn compute_swap_step(
+        sqrt_ratio_current: u128,
+        sqrt_ratio_target: u128,
+        liquidity: i128,
+        amount: i128,
+    ) -> i128 {
+        Self::compute_swap_step_values(
+            sqrt_ratio_current,
+            sqrt_ratio_target,
+            liquidity,
+            amount,
+        )
+        .1
+    }
+
     pub fn apply_fee(amount_in: i128, fee_bps: u32) -> i128 {
         amount_in
             .checked_mul((FEE_DENOMINATOR - fee_bps) as i128)
@@ -947,6 +1142,41 @@ mod tests {
     }
 
     #[test]
+    fn test_tick_sqrt_prices_match_uniswap_reference_values() {
+        assert_eq!(MultiAssetSwap::tick_to_sqrt_price_x96(0), 79_228_162_514_264_337_593_543_950_336);
+        assert_eq!(MultiAssetSwap::tick_to_sqrt_price_x96(1), 79_232_123_823_359_799_118_286_999_567);
+        assert_eq!(MultiAssetSwap::tick_to_sqrt_price_x96(-1), 79_224_201_403_219_477_170_569_942_574);
+    }
+
+    #[test]
+    fn test_initialize_tick_stores_canonical_price() {
+        let (env, contract_id, _admin, _alice, _token_a, _token_b) = setup();
+        let client = MultiAssetSwapClient::new(&env, &contract_id);
+        let tick = 60;
+        let sqrt_price = MultiAssetSwap::tick_to_sqrt_price_x96(tick);
+
+        client.initialize_tick(&tick, &sqrt_price);
+
+        assert_eq!(client.get_tick_sqrt_price(&tick), sqrt_price);
+    }
+
+    #[test]
+    fn test_compute_swap_step_matches_one_tick_reference() {
+        let (env, contract_id, _admin, _alice, _token_a, _token_b) = setup();
+        let client = MultiAssetSwapClient::new(&env, &contract_id);
+        let sqrt_price_current = MultiAssetSwap::tick_to_sqrt_price_x96(0);
+        let sqrt_price_target = MultiAssetSwap::tick_to_sqrt_price_x96(1);
+        let amount_out = client.compute_swap_step(
+            &sqrt_price_current,
+            &sqrt_price_target,
+            &1_000_000,
+            &50,
+        );
+
+        assert_eq!(amount_out, 49);
+    }
+
+    #[test]
     fn test_concentrated_liquidity_mint() {
         let (env, contract_id, _admin, alice, _token_a, _token_b) = setup();
         let client = MultiAssetSwapClient::new(&env, &contract_id);
@@ -993,8 +1223,7 @@ mod tests {
         let initial_balance_b = b_client.balance(&alice);
 
         // Swap token_a for token_b: price limit must be strictly below current price
-        let current_price = MultiAssetSwap::tick_to_sqrt_price_x96(0);
-        let sqrt_price_limit = current_price - 1;
+        let sqrt_price_limit = MultiAssetSwap::tick_to_sqrt_price_x96(-60);
 
         // Use a large swap amount relative to pool size for non-zero output
         let swap_amount = 5_000_000_i128;
@@ -1009,7 +1238,8 @@ mod tests {
         assert!(amount_out > 0);
 
         // Check balances changed
-        assert_eq!(a_client.balance(&alice), initial_balance_a - swap_amount);
+        assert!(a_client.balance(&alice) < initial_balance_a);
+        assert!(a_client.balance(&alice) > initial_balance_a - swap_amount);
         assert!(b_client.balance(&alice) > initial_balance_b);
     }
 
@@ -1064,14 +1294,12 @@ mod tests {
         // Add liquidity
         client.mint(&alice, &-60, &60, &100_000_i128, &100_000_i128);
 
-        let current_price = MultiAssetSwap::tick_to_sqrt_price_x96(0);
-
         // First swap at base fee
-        let price_limit_1 = current_price - 1;
+        let price_limit_1 = MultiAssetSwap::tick_to_sqrt_price_x96(-1);
         let _amount_out_1 = client.swap(&alice, &token_a, &5_000_000_i128, &price_limit_1, &0);
 
         // Second swap
-        let price_limit_2 = current_price - 2;
+        let price_limit_2 = MultiAssetSwap::tick_to_sqrt_price_x96(-2);
         let amount_out_2 = client.swap(&alice, &token_a, &5_000_000_i128, &price_limit_2, &0);
 
         // Verify swap succeeds and returns a positive amount
@@ -1083,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "slippage protection: amount out below minimum")]
+    #[should_panic(expected = "SlippageExceeded")]
     fn test_slippage_protection() {
         let (env, contract_id, _admin, alice, token_a, token_b) = setup();
         let client = MultiAssetSwapClient::new(&env, &contract_id);
@@ -1091,12 +1319,14 @@ mod tests {
         // Add liquidity
         client.mint(&alice, &-60, &60, &10_000, &10_000);
 
-        // Perform swap with unrealistic min_amount_out that will fail
+        // Perform swap with unrealistic min_amount_out that will fail.
+        // SwapError::SlippageExceeded is raised via panic_with_error! when
+        // amount_out < min_amount_out.
         let sqrt_price_limit = MultiAssetSwap::tick_to_sqrt_price_x96(-1);
         client.swap(
-            &alice, 
-            &token_a, 
-            &1_000, 
+            &alice,
+            &token_a,
+            &1_000,
             &sqrt_price_limit,
             &100_000  // Unrealistic minimum that will fail
         );
@@ -1108,6 +1338,8 @@ mod tests {
         let client = MultiAssetSwapClient::new(&env, &contract_id);
 
         let bob = Address::generate(&env);
+
+        client.set_referral_fee_rate(&10_000);
 
         // Set bob as alice's referrer
         client.set_referrer(&alice, &bob);

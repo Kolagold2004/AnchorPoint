@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env};
 
 // ============================================================================
 // Storage Keys (Minimized Entropy)
@@ -68,6 +68,8 @@ impl IndexingContract {
             &DataKey::Counter,
             &(id.checked_add(1).expect("counter overflow")),
         );
+        env.events()
+            .publish((symbol_short!("user_reg"), id), user);
 
         id
     }
@@ -104,6 +106,8 @@ impl IndexingContract {
         env.storage()
             .persistent()
             .set(&DataKey::ActiveBitmap(bitmap_index), &bitmap);
+        env.events()
+            .publish((symbol_short!("active"), id), active);
     }
 
     pub fn is_active(env: Env, id: u32) -> bool {
@@ -129,6 +133,8 @@ impl IndexingContract {
         env.storage()
             .temporary()
             .set(&DataKey::LastActive(id), &now);
+        env.events()
+            .publish((symbol_short!("activity"), id), now);
 
         // Optionally renew to keep it alive for another 10,000 blocks
         // env.storage().temporary().extend_ttl(&DataKey::LastActive(id), 10000, 10000);
@@ -151,6 +157,8 @@ impl IndexingContract {
         env.storage()
             .persistent()
             .set(&DataKey::UserData(id), &data);
+        env.events()
+            .publish((symbol_short!("user_data"), id), data);
     }
 
     pub fn get_user_data(env: Env, id: u32) -> UserData {
@@ -167,7 +175,7 @@ impl IndexingContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
 
     #[test]
     fn test_optimized_registration() {
@@ -185,6 +193,7 @@ mod tests {
         assert_eq!(id1, 0);
         assert_eq!(id2, 1);
         assert_eq!(client.get_user_id(&user1), 0);
+        assert_eq!(env.events().all().len(), 2);
     }
 
     #[test]
@@ -205,6 +214,7 @@ mod tests {
 
         client.set_active(&63, &false);
         assert!(!client.is_active(&63));
+        assert_eq!(env.events().all().len(), 4);
     }
 
     #[test]
@@ -217,5 +227,6 @@ mod tests {
         client.update_activity(&123);
         let last = client.get_last_active(&123);
         assert_eq!(last, 100);
+        assert_eq!(env.events().all().len(), 1);
     }
 }

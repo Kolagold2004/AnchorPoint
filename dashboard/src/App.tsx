@@ -1,4 +1,4 @@
-import React, { lazy, Suspense, useCallback, useEffect, useMemo, useState, createContext, useContext } from 'react';
+import React, { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   LayoutDashboard,
   ArrowUpRight,
@@ -25,20 +25,14 @@ import { StatusBanner } from './components/StatusBanner';
 import { UserAvatarDropdown } from './components/UserAvatarDropdown';
 import { CopyablePublicKey } from './components/CopyablePublicKey';
 import { WalletModal } from './components/WalletModal';
-import { NetworkSelector } from './components/NetworkSelector';
+import { NetworkSelector, NetworkBanner } from './components/NetworkSelector';
+import { NetworkProvider } from './contexts/NetworkContext';
 import { SessionTimeoutModal } from './components/Auth/SessionTimeoutModal';
-import { FreighterAdapter } from './lib/wallet/FreighterAdapter';
-import { I18nProvider, useTranslation } from './i18n/config';
+import { WalletManager } from './lib/wallet';
+import { I18nProvider, useTranslation, type Language } from './i18n/config';
+import { ThemeProvider, useTheme } from './contexts/ThemeContext';
 
-const ThemeContext = createContext<{
-  theme: 'light' | 'dark';
-  toggleTheme: () => void;
-}>({
-  theme: 'dark',
-  toggleTheme: () => {},
-});
-
-export const useTheme = () => useContext(ThemeContext);
+export { useTheme };
 
 const DashboardOverview = lazy(() => import('./components/DashboardOverview'));
 const TransactionHistory = lazy(() => import('./components/TransactionHistory'));
@@ -149,8 +143,25 @@ const TabFallback = () => (
 );
 
 const App = () => {
+  const { resolvedTheme } = useTheme();
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.classList.remove('light', 'dark');
+    root.classList.add(resolvedTheme);
+  }, [resolvedTheme]);
+
+  return (
+    <I18nProvider>
+      <AppShell />
+    </I18nProvider>
+  );
+};
+
+const AppShell = () => {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [isDesktop, setIsDesktop] = useState(false);
   const [uiConfig, setUiConfig] = useState<UiConfig>(defaultUiConfig);
   const [loadingState, setLoadingState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [wallet, setWallet] = useState<{ publicKey: string; network: string } | null>(null);
@@ -158,21 +169,9 @@ const App = () => {
   const [walletError, setWalletError] = useState('');
   const [walletModalOpen, setWalletModalOpen] = useState(false);
   const [walletSessionResetCounter, setWalletSessionResetCounter] = useState(0);
-  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
-    const stored = localStorage.getItem('theme');
-    if (stored === 'light' || stored === 'dark') return stored;
-    return 'dark';
-  });
-  const walletAdapter = useMemo(() => new FreighterAdapter(), []);
+  const [selectedWalletId, setSelectedWalletId] = useState<string | null>(null);
+  const walletManager = useMemo(() => WalletManager.getInstance(), []);
   const { t, language, changeLanguage } = useTranslation();
-
-  const toggleTheme = useCallback(() => {
-    setTheme((prev) => {
-      const next = prev === 'dark' ? 'light' : 'dark';
-      localStorage.setItem('theme', next);
-      return next;
-    });
-  }, []);
 
   const clearClientSessionState = useCallback(() => {
     const shouldClearKey = (key: string) => /token|session|wallet|transaction|balance/i.test(key);
@@ -193,9 +192,9 @@ const App = () => {
   }, []);
 
   const handleWalletDisconnect = useCallback(async (skipAdapterDisconnect = false) => {
-    if (!skipAdapterDisconnect) {
+    if (!skipAdapterDisconnect && selectedWalletId) {
       try {
-        await walletAdapter.disconnect();
+        await walletManager.disconnectWallet(selectedWalletId);
       } catch (error) {
         console.warn('Wallet disconnect cleanup failed:', error);
       }
@@ -205,9 +204,10 @@ const App = () => {
     setWallet(null);
     setWalletStatus('idle');
     setWalletError('');
+    setSelectedWalletId(null);
     setActiveTab('dashboard');
     setWalletSessionResetCounter((previous) => previous + 1);
-  }, [clearClientSessionState, walletAdapter]);
+  }, [clearClientSessionState, walletManager, selectedWalletId]);
 
   useEffect(() => {
     let ignore = false;
@@ -243,19 +243,25 @@ const App = () => {
 
   useEffect(() => {
     const handleExternalDisconnect = () => {
-      void handleWalletDisconnect(true);
+      if (selectedWalletId === 'freighter') {
+        void handleWalletDisconnect(true);
+      }
     };
 
     window.addEventListener('freighter:disconnect', handleExternalDisconnect);
     return () => {
       window.removeEventListener('freighter:disconnect', handleExternalDisconnect);
     };
-  }, [handleWalletDisconnect]);
+  }, [handleWalletDisconnect, selectedWalletId]);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia('(min-width: 768px)');
-    const handleMediaChange = (event: MediaQueryListEvent) => setSidebarOpen(event.matches);
+    const handleMediaChange = (event: MediaQueryListEvent) => {
+      setIsDesktop(event.matches);
+      setSidebarOpen(event.matches);
+    };
 
+    setIsDesktop(mediaQuery.matches);
     setSidebarOpen(mediaQuery.matches);
     mediaQuery.addEventListener('change', handleMediaChange);
 
@@ -264,11 +270,25 @@ const App = () => {
     };
   }, []);
 
+  // Lock body scroll while the mobile drawer is open so the drawer is the only
+  // scrollable surface. Desktop keeps the sidebar docked, so it never locks.
   useEffect(() => {
-    const root = document.documentElement;
-    root.classList.remove('light', 'dark');
-    root.classList.add(theme);
-  }, [theme]);
+    if (isDesktop || !sidebarOpen) return;
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [isDesktop, sidebarOpen]);
+
+  useEffect(() => {
+    // Load saved wallet preference
+    const savedWalletId = localStorage.getItem('preferredWalletId');
+    if (savedWalletId) {
+      setSelectedWalletId(savedWalletId);
+    }
+  }, []);
 
   const menuItems = useMemo(
     () => [
@@ -286,35 +306,30 @@ const App = () => {
     [t],
   );
 
-  const handleConnectWallet = async () => {
+  const handleConnectWallet = async (walletId: string) => {
     setWalletStatus('connecting');
     setWalletError('');
 
     try {
-      const connectedWallet = await walletAdapter.connect();
+      const connectedWallet = await walletManager.connectWallet(walletId);
       setWallet(connectedWallet);
+      setSelectedWalletId(walletId);
       setWalletStatus('idle');
+      
+      // Save wallet preference to localStorage
+      localStorage.setItem('preferredWalletId', walletId);
     } catch (error) {
       setWalletStatus('error');
       setWalletError(error instanceof Error ? error.message : 'Unable to connect wallet.');
     }
   };
 
-  const handleWalletOptionSelect = async (walletId: 'freighter' | 'albedo' | 'rango') => {
+  const handleWalletOptionSelect = async (walletId: string) => {
     setWalletModalOpen(false);
-
-    if (walletId !== 'freighter') {
-      setWalletStatus('error');
-      setWalletError(`${walletId.charAt(0).toUpperCase()}${walletId.slice(1)} support will be available soon.`);
-      return;
-    }
-
-    await handleConnectWallet();
+    await handleConnectWallet(walletId);
   };
 
   return (
-    <ThemeContext.Provider value={{ theme, toggleTheme }}>
-    <I18nProvider>
     <div
       className="min-h-screen flex"
       style={
@@ -343,7 +358,7 @@ const App = () => {
         onSelect={handleWalletOptionSelect}
       >
         <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/80 px-3 py-2 text-xs text-slate-400">
-          <span>Freighter connection is available now.</span>
+          <span>Multiple wallet options available</span>
           <span>{walletStatus === 'connecting' ? 'Connecting…' : 'Select a provider to continue'}</span>
         </div>
       </WalletModal>
@@ -351,12 +366,12 @@ const App = () => {
       <SessionTimeoutModal />
 
       <main className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-30 flex min-h-16 items-center justify-between gap-3 border-b border-slate-800 bg-background/80 px-3 py-3 backdrop-blur-md sm:px-6 lg:px-8">
+        <header className="sticky top-0 z-30 flex min-h-16 flex-wrap items-center justify-between gap-2 border-b border-slate-800 bg-background/80 px-2 py-3 backdrop-blur-md sm:px-6 lg:px-8">
           <button
             aria-label={sidebarOpen ? 'Close navigation menu' : 'Open navigation menu'}
             aria-expanded={sidebarOpen}
             aria-controls="main-sidebar"
-            className="rounded p-2 -ml-2 lg:hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+            className="relative z-20 -ml-2 rounded bg-background p-2 sm:hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
             onClick={() => setSidebarOpen(!sidebarOpen)}
           >
             {sidebarOpen ? <X aria-hidden="true" /> : <Menu aria-hidden="true" />}
@@ -365,7 +380,7 @@ const App = () => {
           <div className="flex min-w-0 flex-1 items-center justify-end gap-2 sm:gap-4">
             <div
               data-testid="backend-status"
-              className="hidden items-center gap-2 rounded-full border border-slate-700 bg-slate-900 px-3 py-1.5 md:flex"
+              className="hidden items-center gap-2 rounded-full border border-slate-700 bg-slate-900 px-3 py-1.5 sm:flex"
               role="status"
               aria-live="polite"
               aria-label={
@@ -393,7 +408,7 @@ const App = () => {
               {wallet ? (
                 <div className="flex items-center gap-2">
                   <CopyablePublicKey publicKey={wallet.publicKey} label={`${wallet.network} public key`} />
-                  <span className="hidden rounded-full border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-300 md:inline">
+                  <span className="hidden rounded-full border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-300 sm:inline">
                     0.00 XLM
                   </span>
                 </div>
@@ -411,7 +426,7 @@ const App = () => {
                 </button>
               )}
               {walletStatus === 'error' && !wallet ? (
-                <span className="hidden max-w-48 truncate text-xs text-rose-300 md:inline" role="alert">
+                <span className="hidden max-w-48 truncate text-xs text-rose-300 sm:inline" role="alert">
                   {walletError}
                 </span>
               ) : null}
@@ -419,15 +434,19 @@ const App = () => {
               <select
                 aria-label={t('language.label')}
                 value={language}
-                onChange={(event) => changeLanguage(event.target.value as 'en' | 'es' | 'pt')}
+                onChange={(event) => changeLanguage(event.target.value as Language)}
                 className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-200"
               >
                 <option value="en">{t('language.en')}</option>
                 <option value="es">{t('language.es')}</option>
                 <option value="pt">{t('language.pt')}</option>
+                <option value="fr">{t('language.fr')}</option>
+                <option value="ar">{t('language.ar') || 'العربية'}</option>
+                <option value="he">{t('language.he') || 'עברית'}</option>
               </select>
-              <NetworkSelector apiBaseUrl={apiBaseUrl} />
+              <NetworkSelector />
               <UserAvatarDropdown
+                walletAddress={wallet?.publicKey}
                 onSettings={() => setActiveTab('settings')}
                 onNotifications={() => setActiveTab('notifications')}
                 onSignOut={() => {
@@ -436,6 +455,8 @@ const App = () => {
               />
           </div>
         </header>
+
+        <NetworkBanner />
 
         <section
           className="mx-auto w-full max-w-7xl px-3 py-5 sm:px-6 sm:py-8 lg:px-8"
@@ -487,8 +508,8 @@ const App = () => {
                 {activeTab === 'dashboard' && (
                   <DashboardOverview uiConfig={uiConfig} isLoading={loadingState === 'loading'} />
                 )}
-                {activeTab === 'deposit' && <SEP24Flow type="deposit" uiConfig={uiConfig} />}
-                {activeTab === 'withdraw' && <SEP24Flow type="withdraw" uiConfig={uiConfig} />}
+                {activeTab === 'deposit' && <SEP24Flow type="deposit" uiConfig={uiConfig} apiBaseUrl={apiBaseUrl} />}
+                {activeTab === 'withdraw' && <SEP24Flow type="withdraw" uiConfig={uiConfig} apiBaseUrl={apiBaseUrl} />}
                 {activeTab === 'history' && <TransactionHistory />}
                 {activeTab === 'sep38' && <Sep38QuotePanel />}
                 {activeTab === 'status' && <ServiceStatusPanel />}
@@ -518,25 +539,41 @@ const App = () => {
         </section>
       </main>
     </div>
-    </ThemeContext.Provider>
   );
 };
 
+/** Navbar switch that flips between the light and dark palettes. */
 const ThemeToggle = () => {
-  const { theme, toggleTheme } = useTheme();
+  const { resolvedTheme, toggleTheme } = useTheme();
+  const next = resolvedTheme === 'dark' ? 'light' : 'dark';
 
   return (
     <button
       type="button"
+      role="switch"
+      aria-checked={resolvedTheme === 'dark'}
       onClick={toggleTheme}
-      aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+      aria-label={`Switch to ${next} theme`}
       className="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-300 transition-all hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
     >
-      {theme === 'dark' ? <Sun size={16} aria-hidden="true" /> : <Moon size={16} aria-hidden="true" />}
-      <span className="hidden sm:inline">{theme === 'dark' ? 'Light' : 'Dark'}</span>
+      {resolvedTheme === 'dark' ? (
+        <Sun size={16} aria-hidden="true" />
+      ) : (
+        <Moon size={16} aria-hidden="true" />
+      )}
+      <span className="hidden sm:inline">{resolvedTheme === 'dark' ? 'Light' : 'Dark'}</span>
     </button>
-    </I18nProvider>
   );
 };
 
-export default App;
+const AppRoot = () => (
+  <ThemeProvider>
+    <I18nProvider>
+      <NetworkProvider apiBaseUrl={apiBaseUrl}>
+        <App />
+      </NetworkProvider>
+    </I18nProvider>
+  </ThemeProvider>
+);
+
+export default AppRoot;

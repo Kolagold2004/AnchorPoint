@@ -20,6 +20,7 @@ const prismaMock = {
     findFirst: jest.fn(),
     delete: jest.fn(),
     findUnique: jest.fn(),
+    updateMany: jest.fn(),
   },
 };
 
@@ -293,6 +294,49 @@ describe('Sep12Controller', () => {
     });
   });
 
+  describe('soft delete (#1197)', () => {
+    it('soft-deletes the customer instead of removing the row', async () => {
+      prismaMock.user.findUnique.mockResolvedValue({ id: 'user-1', publicKey: VALID_ACCOUNT });
+      prismaMock.kycCustomer.updateMany.mockResolvedValue({ count: 1 });
+      const req = { params: { account: VALID_ACCOUNT } } as unknown as Request;
+      const res = makeRes();
+
+      await sep12Controller.deleteCustomer(req, res);
+
+      expect(prismaMock.kycCustomer.updateMany).toHaveBeenCalledWith({
+        where: { userId: 'user-1', deletedAt: null },
+        data: { deletedAt: expect.any(Date) },
+      });
+      expect(prismaMock.kycCustomer.delete).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(200);
+    });
+
+    it('returns 404 when there is no live customer record', async () => {
+      prismaMock.user.findUnique.mockResolvedValue({ id: 'user-1', publicKey: VALID_ACCOUNT });
+      prismaMock.kycCustomer.updateMany.mockResolvedValue({ count: 0 });
+      const req = { params: { account: VALID_ACCOUNT } } as unknown as Request;
+      const res = makeRes();
+
+      await sep12Controller.deleteCustomer(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+
+    it('treats a soft-deleted customer as not found on GET', async () => {
+      prismaMock.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        publicKey: VALID_ACCOUNT,
+        kycCustomer: { status: 'ACCEPTED', deletedAt: new Date() },
+      });
+      const req = { query: { account: VALID_ACCOUNT } } as unknown as Request;
+      const res = makeRes();
+
+      await sep12Controller.getCustomer(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+  });
+
   describe('putCustomer', () => {
     it('returns 400 when account is missing', async () => {
       const req = {
@@ -372,14 +416,16 @@ describe('Sep12Controller', () => {
         },
         {}
       );
-      expect(prismaMock.kycCustomer.update).toHaveBeenCalledWith({
-        where: { id: 'k1' },
-        data: {
-          provider: 'mock',
-          providerRef: 'mock_123',
-          status: 'PENDING',
-        },
-      });
+      expect(prismaMock.kycCustomer.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'k1' },
+          data: {
+            provider: 'mock',
+            providerRef: 'mock_123',
+            status: 'PENDING',
+          },
+        })
+      );
       expect(res.status).toHaveBeenCalledWith(202);
       expect(res.json).toHaveBeenCalledWith({
         id: VALID_ACCOUNT,
@@ -421,19 +467,66 @@ describe('Sep12Controller', () => {
         {}
       );
 
-      expect(prismaMock.kycCustomer.update).toHaveBeenCalledWith({
-        where: { id: 'k1' },
-        data: {
-          provider: 'mock',
-          providerRef: 'mock_123',
-          status: 'PENDING',
-        },
-      });
+      expect(prismaMock.kycCustomer.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'k1' },
+          data: {
+            provider: 'mock',
+            providerRef: 'mock_123',
+            status: 'PENDING',
+          },
+        })
+      );
 
       expect(res.status).toHaveBeenCalledWith(202);
       expect(res.json).toHaveBeenCalledWith({
         id: VALID_ACCOUNT,
         status: 'PROCESSING',
+      });
+    });
+
+    it('triggers customer.kyc_status_updated webhook when provider immediately accepts customer on PUT', async () => {
+      const req = {
+        body: {
+          account: VALID_ACCOUNT,
+          first_name: 'Jane',
+          last_name: 'Doe',
+          email_address: 'jane@example.com',
+        },
+        user: { publicKey: VALID_ACCOUNT },
+        files: undefined,
+      } as unknown as Request;
+      const res = makeRes();
+
+      const acceptedCustomer = {
+        id: 'k1',
+        userId: 'u1',
+        status: 'ACCEPTED',
+        provider: 'mock',
+        providerRef: 'mock_acc',
+        user: { publicKey: VALID_ACCOUNT },
+      };
+
+      prismaMock.user.findUnique.mockResolvedValue({ id: 'u1', publicKey: VALID_ACCOUNT });
+      prismaMock.kycCustomer.upsert.mockResolvedValue({ id: 'k1', status: 'PENDING' });
+      prismaMock.kycCustomer.update.mockResolvedValue(acceptedCustomer);
+      providerMock.submitCustomer.mockResolvedValue({
+        success: true,
+        status: 'ACCEPTED',
+        providerRef: 'mock_acc',
+      });
+
+      await sep12Controller.putCustomer(req, res);
+
+      expect(webhookServiceMock.sendKycStatusChanged).toHaveBeenCalledWith(
+        acceptedCustomer,
+        'PENDING',
+        undefined
+      );
+      expect(res.status).toHaveBeenCalledWith(202);
+      expect(res.json).toHaveBeenCalledWith({
+        id: VALID_ACCOUNT,
+        status: 'ACCEPTED',
       });
     });
 
@@ -734,7 +827,66 @@ describe('Sep12Controller', () => {
         },
       },
     });
-    expect(webhookServiceMock.sendKycStatusChanged).toHaveBeenCalledWith(updatedCustomer, 'PENDING');
+    expect(webhookServiceMock.sendKycStatusChanged).toHaveBeenCalledWith(
+      updatedCustomer,
+      'PENDING',
+      undefined
+    );
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  it('updates customer KYC status to REJECTED via webhook and includes rejection reasons in webhook dispatch', async () => {
+    const req = {
+      headers: { 'x-kyc-signature': 'mock-valid-signature' },
+      body: {
+        providerRef: 'mock_rej_1',
+        status: 'rejected',
+        rejection_reasons: ['SUSPECTED_FRAUD', 'INVALID_DOCUMENT'],
+      },
+    } as unknown as Request;
+    const res = makeRes();
+    const existingCustomer = {
+      id: 'k2',
+      userId: 'u2',
+      provider: 'mock',
+      providerRef: 'mock_rej_1',
+      status: 'PENDING',
+      createdAt: new Date('2026-03-30T10:00:00.000Z'),
+      updatedAt: new Date('2026-03-30T10:00:00.000Z'),
+      user: { publicKey: VALID_ACCOUNT },
+    };
+    const updatedCustomer = {
+      ...existingCustomer,
+      status: 'REJECTED',
+      updatedAt: new Date('2026-03-30T10:05:00.000Z'),
+    };
+
+    providerMock.verifyWebhookSignature.mockReturnValue(true);
+    providerMock.parseWebhook.mockReturnValue({
+      providerRef: 'mock_rej_1',
+      status: 'REJECTED',
+    });
+    prismaMock.kycCustomer.findFirst.mockResolvedValue(existingCustomer);
+    prismaMock.kycCustomer.update.mockResolvedValue(updatedCustomer);
+
+    await sep12Controller.handleWebhook(req, res);
+
+    expect(prismaMock.kycCustomer.update).toHaveBeenCalledWith({
+      where: { id: 'k2' },
+      data: { status: 'REJECTED' },
+      include: {
+        user: {
+          select: {
+            publicKey: true,
+          },
+        },
+      },
+    });
+    expect(webhookServiceMock.sendKycStatusChanged).toHaveBeenCalledWith(
+      updatedCustomer,
+      'PENDING',
+      ['SUSPECTED_FRAUD', 'INVALID_DOCUMENT']
+    );
     expect(res.status).toHaveBeenCalledWith(200);
   });
 

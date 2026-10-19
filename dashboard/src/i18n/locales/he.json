@@ -1,0 +1,52 @@
+{
+  "language": {
+    "label": "שפה",
+    "en": "English",
+    "es": "Español",
+    "pt": "Português",
+    "fr": "Français",
+    "ar": "العربية",
+    "he": "עברית"
+  },
+  "nav": {
+    "overview": "סקירה כללית",
+    "deposit": "הפקדה",
+    "withdraw": "משיכה",
+    "history": "היסטוריה",
+    "sep38": "הצעת מחיר SEP-38",
+    "status": "סטטוס שירות",
+    "notifications": "התראות",
+    "kyc": "סטטוס אימות (KYC)",
+    "settings": "הגדרות"
+  },
+  "wallet": {
+    "connect": "חיבור ארנק",
+    "connecting": "מתחבר...",
+    "disconnect": "ניתוק",
+    "freighter": "Freighter",
+    "albedo": "Albedo",
+    "rango": "Rango"
+  },
+  "settings": {
+    "title": "הגדרות",
+    "appearance": "מראה",
+    "appearanceSubtitle": "הבחירה שלך נשמרת במכשיר זה.",
+    "theme": "ערכת נושא",
+    "language": "שפה",
+    "languageSubtitle": "בחר את השפה המועדפת עליך עבור לוח הבקרה.",
+    "branding": "הגדרות מיתוג"
+  },
+  "staking": {
+    "title": "לוח נעילת אסימונים (Staking) בזמן אמת",
+    "subtitle": "נהל את יתרת הנעילה שלך, עקוב אחר תגמולים בזמן אמת ותקופות נעילה.",
+    "livePosition": "פוזיציה פעילה",
+    "stakedAmount": "סכום נעול",
+    "earnedRewards": "תגמולים שנצברו",
+    "lockTier": "רמת נעילה",
+    "unlockDate": "תאריך פתיחה",
+    "apy": "תשואה שנתית (APY)",
+    "stakeAction": "הוסף לנעילה",
+    "unstakeAction": "שחרר מנעילה",
+    "claimAction": "משוך תגמולים"
+  }
+}

@@ -45,7 +45,16 @@ describe('Backend API', () => {
     expect(res.statusCode).toEqual(200);
     expect(res.body.status).toEqual('UP');
     expect(res.body.services.database).toEqual('UP');
-    expect(res.body.services.redis).toEqual('UP');
+    expect(res.body.services.redis.status).toEqual('UP');
+    expect(typeof res.body.services.redis.latencyMs).toBe('number');
+  });
+
+  it('should report KMS and KYC provider status on health check', async () => {
+    const res = await request(app).get('/health');
+    expect(res.body.services.kms).toEqual('NOT_CONFIGURED');
+    expect(res.body.services.kycProvider).toEqual('UP');
+    expect(res.body.services).toHaveProperty('horizon');
+    expect(res.body.services).toHaveProperty('sorobanRpc');
   });
 
   it('should return DOWN on health check when database is down', async () => {
@@ -55,7 +64,7 @@ describe('Backend API', () => {
     expect(res.statusCode).toEqual(503);
     expect(res.body.status).toEqual('DOWN');
     expect(res.body.services.database).toEqual('DOWN');
-    expect(res.body.services.redis).toEqual('UP');
+    expect(res.body.services.redis.status).toEqual('UP');
   });
 
   it('should return DOWN on health check when Redis is down', async () => {
@@ -65,13 +74,30 @@ describe('Backend API', () => {
     expect(res.statusCode).toEqual(503);
     expect(res.body.status).toEqual('DOWN');
     expect(res.body.services.database).toEqual('UP');
-    expect(res.body.services.redis).toEqual('DOWN');
+    expect(res.body.services.redis.status).toEqual('DOWN');
   });
 
   it('should return 200 on root access', async () => {
     const res = await request(app).get('/');
     expect(res.statusCode).toEqual(200);
     expect(res.text).toContain('AnchorPoint Backend API is running.');
+  });
+
+  it('should set Helmet security headers (CSP, HSTS, frame-guard)', async () => {
+    const res = await request(app).get('/');
+
+    expect(res.headers['content-security-policy']).toEqual(
+      "default-src 'self';frame-ancestors 'none';object-src 'none'"
+    );
+    expect(res.headers['strict-transport-security']).toEqual('max-age=31536000; includeSubDomains; preload');
+    expect(res.headers['x-frame-options']).toEqual('DENY');
+    expect(res.headers['x-content-type-options']).toEqual('nosniff');
+    expect(res.headers['referrer-policy']).toEqual('no-referrer');
+    expect(res.headers['x-xss-protection']).toEqual('0');
+    expect(res.headers['x-download-options']).toEqual('noopen');
+    expect(res.headers['x-permitted-cross-domain-policies']).toEqual('none');
+    expect(res.headers['permissions-policy']).toContain('camera=()');
+    expect(res.headers['x-powered-by']).toBeUndefined();
   });
 
   it('should include CORS header for allowed origin', async () => {

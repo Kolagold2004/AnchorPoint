@@ -1,0 +1,103 @@
+===========================================================================
+  AnchorPoint — {{ .Chart.Name }} v{{ .Chart.Version }}
+  Release: {{ .Release.Name }}  •  Namespace: {{ .Release.Namespace }}
+===========================================================================
+
+Components deployed by this release:
+  backend   always
+{{- if .Values.redis.enabled }}
+  redis     {{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }} ({{ .Values.redis.replicaCount }} replica(s){{ if not .Values.redis.persistence.enabled }}, NO persistence{{ end }})
+{{- else }}
+  redis     external (via REDIS_URL in the backend Secret)
+{{- end }}
+{{- if .Values.postgres.enabled }}
+  postgres  {{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }} (single replica, {{ .Values.postgres.database }})
+{{- else }}
+  postgres  external (via DATABASE_URL in the backend Secret)
+{{- end }}
+{{- if .Values.dashboard.enabled }}
+  dashboard {{ .Values.dashboard.image.repository }}:{{ .Values.dashboard.image.tag }} ({{ .Values.dashboard.replicaCount }} replica(s))
+{{- else }}
+  dashboard not deployed
+{{- end }}
+
+1. Get the application URL:
+
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+  https://{{ .host }}
+{{- end }}
+
+{{- else if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get svc {{ include "anchor-point.fullname" . }} \
+    -n {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}")
+  export NODE_IP=$(kubectl get nodes \
+    -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo "http://$NODE_IP:$NODE_PORT"
+
+{{- else if contains "LoadBalancer" .Values.service.type }}
+  NOTE: It may take a few minutes for the LoadBalancer IP to be assigned.
+  Watch with: kubectl get svc -n {{ .Release.Namespace }} -w {{ include "anchor-point.fullname" . }}
+
+  export SERVICE_IP=$(kubectl get svc {{ include "anchor-point.fullname" . }} \
+    -n {{ .Release.Namespace }} -o jsonpath="{.status.loadBalancer.ingress[0].ip}")
+  echo "http://$SERVICE_IP:{{ .Values.service.port }}"
+
+{{- else }}
+  # Port-forward for local access
+  kubectl port-forward svc/{{ include "anchor-point.fullname" . }} \
+    8080:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+  echo "http://127.0.0.1:8080"
+{{- end }}
+
+2. Check pod status:
+   kubectl get pods -n {{ .Release.Namespace }} -l {{ include "anchor-point.selectorLabels" . | replace ": " "=" | replace "\n" "," }}
+
+3. Tail logs:
+   kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "anchor-point.name" . }} -f
+
+4. Prometheus metrics endpoint:
+   kubectl port-forward svc/{{ include "anchor-point.fullname" . }} \
+     9464:{{ .Values.service.metricsPort }} -n {{ .Release.Namespace }}
+   curl http://127.0.0.1:9464/metrics
+
+{{- if .Values.autoscaling.enabled }}
+
+5. HPA status:
+   kubectl get hpa {{ include "anchor-point.fullname" . }} -n {{ .Release.Namespace }}
+{{- end }}
+
+{{- if and .Values.redis.enabled (not .Values.redis.auth.existingSecret) }}
+⚠️  The chart-managed Redis expects a Secret named
+   {{ include "anchor-point.redis.secretName" . }} with key
+   '{{ .Values.redis.auth.secretKey }}'. Create it before installing, or set
+   redis.auth.existingSecret:
+
+   kubectl create secret generic {{ include "anchor-point.redis.secretName" . }} \
+     -n {{ .Release.Namespace }} --from-literal={{ .Values.redis.auth.secretKey }}='<password>'
+{{- end }}
+
+{{- if and .Values.postgres.enabled (not .Values.postgres.auth.existingSecret) }}
+⚠️  The chart-managed Postgres expects a Secret named
+   {{ include "anchor-point.postgres.secretName" . }} with keys
+   '{{ .Values.postgres.auth.userKey }}' and '{{ .Values.postgres.auth.passwordKey }}':
+
+   kubectl create secret generic {{ include "anchor-point.postgres.secretName" . }} \
+     -n {{ .Release.Namespace }} \
+     --from-literal={{ .Values.postgres.auth.userKey }}='anchorpoint' \
+     --from-literal={{ .Values.postgres.auth.passwordKey }}='<password>'
+{{- end }}
+
+{{- if not .Values.secrets.existingSecret }}
+
+⚠️  WARNING: No existingSecret was configured. Create the Secret before
+   deploying to prevent pods from failing to start:
+
+   kubectl create secret generic {{ include "anchor-point.fullname" . }}-secrets \
+     -n {{ .Release.Namespace }} \
+     --from-literal=REDIS_URL='redis://:password@redis:6379' \
+     --from-literal=DATABASE_URL='postgresql://user:pass@host/db' \
+     --from-literal=STELLAR_PASSPHRASE='...' \
+     --from-literal=STELLAR_DEPLOYER_SECRET='...' \
+     --from-literal=JWT_SECRET='...'
+{{- end }}

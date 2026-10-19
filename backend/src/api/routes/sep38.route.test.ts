@@ -24,21 +24,22 @@ import sep38Router from './sep38.route';
 
 jest.mock('../controllers/sep38.controller', () => ({
   sep38Controller: {
-    getPriceQuote: jest.fn(async (sourceAsset: string, sourceAmount: number, destinationAsset: string, context?: string) => ({
+    getPriceQuote: jest.fn(async (sourceAsset: string, sourceAmount: string, destinationAsset: string, context?: string) => ({
       ...(sourceAsset === 'INVALID' || destinationAsset === 'INVALID'
         ? (() => { throw new Error('Unsupported asset'); })()
         : {}),
       source_asset: sourceAsset,
       source_amount: sourceAmount,
       destination_asset: destinationAsset,
-      destination_amount: sourceAsset.toUpperCase() === destinationAsset.toUpperCase() ? sourceAmount : sourceAsset === 'USDC' ? sourceAmount / 0.12 : sourceAmount * 0.12,
-      price: sourceAsset === 'USDC' && destinationAsset === 'XLM' ? 8.33 : 0.12,
-      fee: sourceAmount <= 1000 ? sourceAmount * 0.003 : sourceAmount * 0.0005,
+      destination_amount: sourceAsset.toUpperCase() === destinationAsset.toUpperCase() ? sourceAmount : sourceAsset === 'USDC' ? (parseFloat(sourceAmount) / 0.12).toFixed(7) : (parseFloat(sourceAmount) * 0.12).toFixed(7),
+      price: sourceAsset === 'USDC' && destinationAsset === 'XLM' ? '8.3333333' : '0.1200000',
+      price_decimals: 7,
+      fee: parseFloat(sourceAmount) <= 1000 ? (parseFloat(sourceAmount) * 0.003).toFixed(7) : (parseFloat(sourceAmount) * 0.0005).toFixed(7),
       expiration_time: Math.floor(Date.now() / 1000) + 60,
       context,
       cached: false,
     })),
-    createQuote: jest.fn(async (sourceAsset: string, sourceAmount: number, destinationAsset: string, context?: string) => ({
+    createQuote: jest.fn(async (sourceAsset: string, sourceAmount: string, destinationAsset: string, context?: string) => ({
       ...(sourceAsset === 'INVALID' || destinationAsset === 'INVALID'
         ? (() => { throw new Error('Unsupported asset'); })()
         : {}),
@@ -46,9 +47,10 @@ jest.mock('../controllers/sep38.controller', () => ({
       source_asset: sourceAsset,
       source_amount: sourceAmount,
       destination_asset: destinationAsset,
-      destination_amount: sourceAmount / 0.12,
-      price: 8.33,
-      fee: sourceAmount <= 1000 ? sourceAmount * 0.003 : sourceAmount * 0.0005,
+      destination_amount: (parseFloat(sourceAmount) / 0.12).toFixed(7),
+      price: '8.3333333',
+      price_decimals: 7,
+      fee: parseFloat(sourceAmount) <= 1000 ? (parseFloat(sourceAmount) * 0.003).toFixed(7) : (parseFloat(sourceAmount) * 0.0005).toFixed(7),
       expiration_time: Math.floor(Date.now() / 1000) + 300,
       context,
     })),
@@ -76,11 +78,11 @@ describe('SEP-38 Price Quotes API', () => {
 
       expect(response.status).toBe(200);
       expect(response.body).toHaveProperty('source_asset', 'USDC');
-      expect(response.body).toHaveProperty('source_amount', 100);
+      expect(parseFloat(response.body.source_amount)).toBe(100);
       expect(response.body).toHaveProperty('destination_asset', 'XLM');
       expect(response.body).toHaveProperty('destination_amount');
       expect(response.body).toHaveProperty('price');
-      expect(response.body.destination_amount).toBeGreaterThan(0);
+      expect(parseFloat(response.body.destination_amount)).toBeGreaterThan(0);
     });
 
     it('should handle XLM to USDC conversion', async () => {
@@ -95,7 +97,7 @@ describe('SEP-38 Price Quotes API', () => {
       expect(response.status).toBe(200);
       expect(response.body.source_asset).toBe('XLM');
       expect(response.body.destination_asset).toBe('USDC');
-      expect(response.body.price).toBeLessThan(1); // XLM is worth less than USDC
+      expect(parseFloat(response.body.price)).toBeLessThan(1); // XLM is worth less than USDC
     });
 
     it('should return error for missing parameters', async () => {
@@ -152,6 +154,47 @@ describe('SEP-38 Price Quotes API', () => {
     });
   });
 
+  describe('GET /sep38/prices', () => {
+    it('should return multiple prices when only sell_asset is provided', async () => {
+      const response = await request(app)
+        .get('/sep38/prices')
+        .query({
+          sell_asset: 'USDC',
+          sell_amount: '100',
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveProperty('buy_assets');
+      expect(Array.isArray(response.body.buy_assets)).toBe(true);
+      expect(response.body.buy_assets.length).toBeGreaterThan(0);
+      expect(response.body.buy_assets[0]).toHaveProperty('asset');
+      expect(response.body.buy_assets[0]).toHaveProperty('price');
+    });
+
+    it('should return single pair quote when buy_asset is specified', async () => {
+      const response = await request(app)
+        .get('/sep38/prices')
+        .query({
+          sell_asset: 'USDC',
+          sell_amount: '100',
+          buy_asset: 'XLM',
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveProperty('buy_assets');
+      expect(response.body).toHaveProperty('source_asset', 'USDC');
+      expect(response.body).toHaveProperty('destination_asset', 'XLM');
+    });
+
+    it('should return 400 when sell_asset is missing', async () => {
+      const response = await request(app)
+        .get('/sep38/prices');
+
+      expect(response.status).toBe(400);
+      expect(response.body).toHaveProperty('error', 'missing_required_params');
+    });
+  });
+
   describe('POST /sep38/quote', () => {
     it('should return price quote for valid POST request', async () => {
       const response = await request(app)
@@ -164,7 +207,7 @@ describe('SEP-38 Price Quotes API', () => {
 
       expect(response.status).toBe(200);
       expect(response.body).toHaveProperty('source_asset', 'USDC');
-      expect(response.body.destination_amount).toBeGreaterThan(0);
+      expect(parseFloat(response.body.destination_amount)).toBeGreaterThan(0);
     });
 
     it('should return error for missing body parameters', async () => {
@@ -223,7 +266,7 @@ describe('SEP-38 Price Quotes API', () => {
         });
 
       expect(response.status).toBe(200);
-      expect(response.body.destination_amount).toBeCloseTo(8.33, 2);
+      expect(parseFloat(response.body.destination_amount)).toBeCloseTo(8.33, 2);
     });
 
     it('should handle decimal precision correctly', async () => {
@@ -236,8 +279,8 @@ describe('SEP-38 Price Quotes API', () => {
         });
 
       expect(response.status).toBe(200);
-      expect(response.body.source_amount).toBe(100.50);
-      expect(typeof response.body.destination_amount).toBe('number');
+      expect(response.body.source_amount).toBe('100.5');
+      expect(typeof response.body.destination_amount).toBe('string');
     });
   });
 
@@ -249,8 +292,8 @@ describe('SEP-38 Price Quotes API', () => {
 
       expect(response.status).toBe(200);
       expect(response.body).toHaveProperty('fee');
-      expect(typeof response.body.fee).toBe('number');
-      expect(response.body.fee).toBeGreaterThanOrEqual(0);
+      expect(typeof response.body.fee).toBe('string');
+      expect(parseFloat(response.body.fee)).toBeGreaterThanOrEqual(0);
     });
 
     it('applies a lower fee percent for large amounts', async () => {
@@ -262,8 +305,8 @@ describe('SEP-38 Price Quotes API', () => {
         .get('/sep38/price')
         .query({ source_asset: 'USDC', source_amount: 200_000, destination_asset: 'XLM' });
 
-      const smallRate = small.body.fee / small.body.source_amount;
-      const largeRate = large.body.fee / large.body.source_amount;
+      const smallRate = parseFloat(small.body.fee) / parseFloat(small.body.source_amount);
+      const largeRate = parseFloat(large.body.fee) / parseFloat(large.body.source_amount);
       expect(largeRate).toBeLessThan(smallRate);
     });
   });

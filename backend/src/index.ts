@@ -1,6 +1,9 @@
+// Must be the first import so OpenTelemetry instruments http/express/ioredis (#1201).
+import { shutdownTracing } from './utils/tracing';
 import http from 'http';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import swaggerUi from 'swagger-ui-express';
 import { config, hydrateEncryptedConfigSecrets } from './config/env';
 import { swaggerSpec } from './config/swagger';
@@ -18,11 +21,14 @@ import metricsRouter from './api/routes/metrics.route';
 import relayerRouter from './api/routes/relayer.route';
 import recurringPaymentsRouter from './api/routes/recurring-payments.route';
 import configRouter from './api/routes/config.route';
+import multisigRouter from './api/routes/multisig.route';
 import sep31Router from './api/routes/sep31.route';
+
 import authRouter from './api/routes/auth.route';
 import { errorHandler } from './api/middleware/error.middleware';
 import { metricsMiddleware, connectionTracker } from './api/middleware/metrics.middleware';
 import { securityHeadersMiddleware } from './api/middleware/security-headers.middleware';
+import { sanitizeRequestMiddleware } from './api/middleware/sanitize.middleware';
 import { tracingMiddleware } from './api/middleware/tracing.middleware';
 import configService from './services/config.service';
 import { stellarService } from './services/stellar.service';
@@ -32,81 +38,129 @@ import eventRouter from './api/routes/event.route';
 import notificationsRouter from './api/routes/notifications.route';
 import { publicLimiter, authLimiter } from './api/middleware/rate-limit.middleware';
 import { notificationService } from './services/notification.service';
-import { createEmailProvider, ConsoleSmsProvider, FcmPushProvider } from './lib/notifications/providers';
+import { createEmailProvider, createSmsProvider, createPushProvider } from './lib/notifications/providers';
 import { NotificationType } from './services/notification.service';
-import { validateKmsConfigOnStartup, verifyDecryptionCapabilityOnStartup } from './lib/key-management.service';
-import queueDashboardRouter from './api/routes/queue-dashboard.route';
+import { validateKmsConfigOnStartup, verifyDecryptionCapabilityOnStartup, getKeyManagementService } from './lib/key-management.service';
+import queueDashboardRouter, { dashboardQueues } from './api/routes/queue-dashboard.route';
 import prisma from './lib/prisma';
 import { redis } from './lib/redis';
 import { validateStorageConfigOnStartup } from './services/storage-provider.service';
 import { uploadExpiryScheduler } from './workers/upload-expiry.scheduler';
+import { dbMetricsScheduler } from './workers/db-metrics.scheduler';
+import { transactionReconcileScheduler } from './workers/transaction-reconcile.scheduler';
 import { initSocket } from './lib/socket';
 import { kycExpiryScheduler } from './workers/kyc-expiry.scheduler';
+import { dataRetentionScheduler } from './workers/data-retention.scheduler';
+import { cleanupWorker } from './workers/cleanup.worker';
+import { feeReportWorker } from './workers/fee-report.worker';
+import contractQueueService from './services/contract-queue.service';
+import { checkMigrationsOnStartup } from './services/migration-check.service';
 
 let server: ReturnType<typeof app.listen> | null = null;
+let isShuttingDown = false;
 
-function gracefulShutdown(signal: string): void {
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (isShuttingDown) {
+    return;
+  }
+  isShuttingDown = true;
+
   logger.info(`${signal} received, initiating graceful shutdown`);
 
-  if (feeReportScheduler) {
-    feeReportScheduler.stop();
-  }
-
-  if (uploadExpiryScheduler) {
-    uploadExpiryScheduler.stop();
-  }
-
-  if (server) {
-    server.close(() => {
-      logger.info('HTTP server closed');
-    });
-  }
-
-  prisma.$disconnect()
-    .then(() => {
-      logger.info('Prisma client disconnected');
-    })
-    .catch((err) => {
-      logger.error('Error disconnecting Prisma client:', err);
-    });
-
-  redis.quit()
-    .then(() => {
-      logger.info('Redis connection closed');
-    })
-    .catch((err) => {
-      logger.error('Error closing Redis connection:', err);
-    });
-
-  setTimeout(() => {
+  const forceExitTimer = setTimeout(() => {
     logger.error('Graceful shutdown timed out, forcing exit');
     process.exit(1);
   }, 30000);
+  forceExitTimer.unref();
+
+  // Stop scheduling new work before tearing down the connections it depends on.
+  feeReportScheduler.stop();
+  uploadExpiryScheduler.stop();
+  kycExpiryScheduler.stop();
+  dataRetentionScheduler.stop();
+  cleanupWorker.stop();
+  dbMetricsScheduler.stop();
+  transactionReconcileScheduler.stop();
+
+  // Stop accepting new HTTP traffic; let in-flight requests finish.
+  if (server) {
+    await new Promise<void>((resolve) => {
+      server!.close((err) => {
+        if (err) {
+          logger.error('Error closing HTTP server:', err);
+        } else {
+          logger.info('HTTP server closed');
+        }
+        resolve();
+      });
+    });
+  }
+
+  // Drain BullMQ queue connections, then close the database and Redis.
+  const steps: Array<[string, () => Promise<unknown>]> = [
+    ['fee report queue', () => feeReportScheduler.closeQueue()],
+    ['fee report worker', () => feeReportWorker.close()],
+    ['contract queue service', () => contractQueueService.close()],
+    ...dashboardQueues.map(
+      (queue): [string, () => Promise<unknown>] => [`${queue.name} queue`, () => queue.close()]
+    ),
+    ['Prisma client', () => prisma.$disconnect()],
+    ['Redis connection', () => redis.quit()],
+    ['OpenTelemetry tracing', () => shutdownTracing()],
+  ];
+
+  for (const [label, action] of steps) {
+    try {
+      await action();
+      logger.info(`${label} closed`);
+    } catch (err) {
+      logger.error(`Error closing ${label}:`, err);
+    }
+  }
+
+  clearTimeout(forceExitTimer);
+  logger.info(`Graceful shutdown complete (${signal})`);
+  process.exit(0);
 }
 
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => { void gracefulShutdown('SIGINT'); });
+process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
 
 // Initialize Notification Engine
 notificationService.registerProvider(NotificationType.EMAIL, createEmailProvider());
-notificationService.registerProvider(NotificationType.SMS, new ConsoleSmsProvider());
-notificationService.registerProvider(NotificationType.PUSH, new FcmPushProvider());
+notificationService.registerProvider(NotificationType.SMS, createSmsProvider());
+notificationService.registerProvider(NotificationType.PUSH, createPushProvider());
 
 const app = express();
 const httpServer = http.createServer(app);
 app.disable('x-powered-by');
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        defaultSrc: ["'self'"],
+        frameAncestors: ["'none'"],
+        objectSrc: ["'none'"],
+      },
+    },
+    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+    frameguard: { action: 'deny' },
+    referrerPolicy: { policy: 'no-referrer' },
+  })
+);
 app.use(securityHeadersMiddleware);
 app.use(tracingMiddleware);
 const PORT = config.PORT;
 
-const configuredOrigins = process.env.PRODUCTION_CORS_ORIGINS ?? '';
+const configuredOrigins = process.env.ALLOWED_ORIGINS || process.env.PRODUCTION_CORS_ORIGINS || '';
 const allowedOrigins = configuredOrigins
   .split(',')
   .map((origin) => origin.trim())
   .filter((origin) => origin.length > 0);
 
 if (process.env.NODE_ENV === 'production' && allowedOrigins.length === 0) {
-  throw new Error('PRODUCTION_CORS_ORIGINS must be configured in production.');
+  throw new Error('ALLOWED_ORIGINS (or PRODUCTION_CORS_ORIGINS) must be configured in production.');
 }
 
 const fallbackLocalOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000'];
@@ -131,8 +185,15 @@ const corsOptions = {
   optionsSuccessStatus: 200,
 };
 app.use(cors(corsOptions));
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req: Request & { rawBody?: string }, _res: Response, buf: Buffer) => {
+      req.rawBody = buf.toString('utf8');
+    },
+  }),
+);
 app.use(express.urlencoded({ extended: true }));
+app.use(sanitizeRequestMiddleware);
 
 /**
  * @swagger
@@ -159,7 +220,7 @@ app.get('/', (req: Request, res: Response) => {
  * /health:
  *   get:
  *     summary: Health check
- *     description: Check if the API server and its backend dependencies (database, Redis, Soroban RPC) are running
+ *     description: Check if the API server and its backend dependencies (database, Redis, Soroban RPC, Horizon, KMS, KYC provider) are running
  *     tags: [Health]
  *     responses:
  *       200:
@@ -187,6 +248,15 @@ app.get('/', (req: Request, res: Response) => {
  *                     sorobanRpc:
  *                       type: string
  *                       example: UP
+ *                     horizon:
+ *                       type: string
+ *                       example: UP
+ *                     kms:
+ *                       type: string
+ *                       example: UP
+ *                     kycProvider:
+ *                       type: string
+ *                       example: UP
  *       503:
  *         description: One or more backend dependencies are down
  *         content:
@@ -212,15 +282,41 @@ app.get('/', (req: Request, res: Response) => {
  *                     sorobanRpc:
  *                       type: string
  *                       example: DOWN
+ *                     horizon:
+ *                       type: string
+ *                       example: DOWN
+ *                     kms:
+ *                       type: string
+ *                       example: UP
+ *                     kycProvider:
+ *                       type: string
+ *                       example: UP
  */
+const HEALTH_CHECK_TIMEOUT_MS = 2000;
+
+function withHealthTimeout<T>(promise: Promise<T>, name: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${name} health check timed out after ${HEALTH_CHECK_TIMEOUT_MS}ms`)),
+      HEALTH_CHECK_TIMEOUT_MS
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 app.get('/health', async (req: Request, res: Response) => {
   let dbStatus = 'UP';
   let redisStatus = 'UP';
+  let redisLatency = 0;
   let sorobanRpcStatus = 'UP';
+  let horizonStatus = 'UP';
+  let kmsStatus = 'UP';
+  let kycProviderStatus = 'UP';
   let isHealthy = true;
 
   try {
-    await prisma.$queryRaw`SELECT 1`;
+    await withHealthTimeout(prisma.$queryRaw`SELECT 1`, 'Database');
   } catch (err) {
     dbStatus = 'DOWN';
     isHealthy = false;
@@ -228,10 +324,13 @@ app.get('/health', async (req: Request, res: Response) => {
   }
 
   try {
-    const pong = await redis.ping();
+    const start = Date.now();
+    const pong = await withHealthTimeout(redis.ping(), 'Redis');
     if (pong !== 'PONG') {
       redisStatus = 'DOWN';
       isHealthy = false;
+    } else {
+      redisLatency = Date.now() - start;
     }
   } catch (err) {
     redisStatus = 'DOWN';
@@ -240,7 +339,7 @@ app.get('/health', async (req: Request, res: Response) => {
   }
 
   try {
-    const rpcHealth = await stellarService.getHealth();
+    const rpcHealth = await withHealthTimeout(stellarService.getHealth(), 'Soroban RPC');
     sorobanRpcStatus = rpcHealth.status;
     if (rpcHealth.status === 'DOWN') {
       isHealthy = false;
@@ -251,13 +350,64 @@ app.get('/health', async (req: Request, res: Response) => {
     logger.error('Health Check - Soroban RPC connection failed:', err);
   }
 
+  try {
+    const horizonHealth = await withHealthTimeout(stellarService.getHorizonHealth(), 'Horizon');
+    horizonStatus = horizonHealth.status;
+    if (horizonHealth.status === 'DOWN') {
+      isHealthy = false;
+    }
+  } catch (err) {
+    horizonStatus = 'DOWN';
+    isHealthy = false;
+    logger.error('Health Check - Horizon connection failed:', err);
+  }
+
+  let kmsService: ReturnType<typeof getKeyManagementService> | null = null;
+  try {
+    kmsService = getKeyManagementService();
+  } catch {
+    // Key management is optional; report it as not configured rather than failing.
+    kmsStatus = 'NOT_CONFIGURED';
+  }
+  if (kmsService) {
+    try {
+      const kmsHealthy = await withHealthTimeout(kmsService.isHealthy(), 'KMS');
+      if (!kmsHealthy) {
+        kmsStatus = 'DOWN';
+        isHealthy = false;
+      }
+    } catch (err) {
+      kmsStatus = 'DOWN';
+      isHealthy = false;
+      logger.error('Health Check - KMS connection failed:', err);
+    }
+  }
+
+  // The KYC provider is an external third party, so it is reported but not treated as critical.
+  const kycProviderUrls: Record<string, string> = {
+    persona: config.PERSONA_API_URL,
+    shufti: config.SHUFTI_API_URL,
+  };
+  const kycProviderUrl = kycProviderUrls[config.KYC_PROVIDER];
+  if (kycProviderUrl) {
+    try {
+      await withHealthTimeout(fetch(kycProviderUrl, { method: 'HEAD' }), 'KYC provider');
+    } catch (err) {
+      kycProviderStatus = 'DOWN';
+      logger.error('Health Check - KYC provider connection failed:', err);
+    }
+  }
+
   const responsePayload = {
     status: isHealthy ? 'UP' : 'DOWN',
     timestamp: new Date().toISOString(),
     services: {
       database: dbStatus,
-      redis: redisStatus,
+      redis: { status: redisStatus, latencyMs: redisLatency },
       sorobanRpc: sorobanRpcStatus,
+      horizon: horizonStatus,
+      kms: kmsStatus,
+      kycProvider: kycProviderStatus,
     },
   };
 
@@ -306,8 +456,10 @@ app.use('/api/config', configRouter);
 app.use('/api/reports', feeReportRouter);
 app.use('/api/events', eventRouter);
 app.use('/api/notifications', notificationsRouter);
+app.use('/api/multisig', multisigRouter);
 
 // Relayer API for gasless token approvals
+
 app.use('/api/relayer', relayerRouter);
 
 // SEP-40 Swap Rates API
@@ -348,6 +500,10 @@ app.use(errorHandler);
 /* istanbul ignore next */
 if (process.env.NODE_ENV !== 'test') {
   (async () => {
+    // Check migrations first
+    await checkMigrationsOnStartup();
+
+    // Validate and hydrate config
     validateKmsConfigOnStartup(config);
     await hydrateEncryptedConfigSecrets();
     const decryptionOk = await verifyDecryptionCapabilityOnStartup({
@@ -359,29 +515,15 @@ if (process.env.NODE_ENV !== 'test') {
       STELLAR_FEE_BUMP_SECRET: process.env.STELLAR_FEE_BUMP_SECRET,
       RELAYER_SECRET_KEY: process.env.RELAYER_SECRET_KEY,
       WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,
+      HORIZON_WEBHOOK_SECRET: process.env.HORIZON_WEBHOOK_SECRET,
       SIGNING_KEY: process.env.SIGNING_KEY,
-  validateKmsConfigOnStartup(config);
-  validateStorageConfigOnStartup();
-
-  configService.initialize()
-    .catch((error) => {
-      logger.error('Failed to initialize config service:', error);
-    })
-    .finally(() => {
-      initSocket(httpServer);
-      httpServer.listen(PORT, () => {
-      server = app.listen(PORT, () => {
-        logger.info(`Backend service listening at http://localhost:${PORT}`);
-        logger.info(`API Documentation available at http://localhost:${PORT}/api-docs`);
-        feeReportScheduler.start();
-        uploadExpiryScheduler.start();
-        kycExpiryScheduler.start();
-      });
     });
+
     if (!decryptionOk && config.NODE_ENV === 'production') {
       logger.error('Aborting startup: encrypted config secrets could not be decrypted');
       process.exit(1);
     }
+
     validateStorageConfigOnStartup();
 
     configService.initialize()
@@ -389,11 +531,17 @@ if (process.env.NODE_ENV !== 'test') {
         logger.error('Failed to initialize config service:', error);
       })
       .finally(() => {
-        app.listen(PORT, () => {
+        initSocket(httpServer);
+        server = httpServer.listen(PORT, () => {
           logger.info(`Backend service listening at http://localhost:${PORT}`);
           logger.info(`API Documentation available at http://localhost:${PORT}/api-docs`);
           feeReportScheduler.start();
           uploadExpiryScheduler.start();
+          kycExpiryScheduler.start();
+          dataRetentionScheduler.start();
+          dbMetricsScheduler.start();
+          transactionReconcileScheduler.start();
+          cleanupWorker.start();
         });
       });
   })().catch((error) => {

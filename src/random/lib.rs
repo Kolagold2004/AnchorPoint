@@ -80,6 +80,8 @@ impl RandomNumberGenerator {
         env.storage()
             .instance()
             .set(&DataKey::MinParticipants, &min_participants);
+        env.events()
+            .publish((symbol_short!("rng_init"),), (admin, min_participants));
     }
 
     /// Start a new round for commit-reveal

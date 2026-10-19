@@ -28,6 +28,9 @@ import { redlock } from '../lib/redis';
 import {
   BatchPaymentRequest,
   BatchPaymentResult,
+  BatchDryRunResult,
+  DryRunBalanceCheck,
+  DryRunRecipientResult,
   PartialFailureResult,
   BatchStatus,
   BatchPaymentError,
@@ -73,14 +76,16 @@ export class BatchPaymentService {
    * Security Note: This method retrieves the signing key from the key management service.
    * The key is held in memory only for the duration of the signing operation.
    */
-  async executeBatch(request: BatchPaymentRequest): Promise<BatchPaymentResult> {
+  async executeBatch(request: BatchPaymentRequest & { dryRun: true }): Promise<BatchDryRunResult>;
+  async executeBatch(request: BatchPaymentRequest): Promise<BatchPaymentResult>;
+  async executeBatch(request: BatchPaymentRequest): Promise<BatchPaymentResult | BatchDryRunResult> {
     const batchId = request.batchId || uuidv4();
     logger.info(`[Batch ${batchId}] Starting batch payment with ${request.payments.length} operations`);
 
     const lockKey = `${this.config.redisKeyPrefix}:lock:${batchId}`;
     let lock: any = null;
 
-    if (this.config.useDistributedLocking && this.lockClient) {
+    if (this.config.useDistributedLocking && this.lockClient && !request.dryRun) {
       try {
         lock = await this.lockClient.acquire([lockKey], this.config.lockTimeoutSeconds * 1000);
         logger.info(`[Batch ${batchId}] Acquired distributed lock`);
@@ -108,8 +113,10 @@ export class BatchPaymentService {
       );
     }
 
-    // Validate all addresses
-    this.validatePayments(request.payments);
+    // Validate all addresses (a dry run reports per-recipient results instead)
+    if (!request.dryRun) {
+      this.validatePayments(request.payments);
+    }
 
     // Retrieve source secret key from key management service or request
     let sourceSecretKey: string;
@@ -145,6 +152,10 @@ export class BatchPaymentService {
     // Get source account from secret key
     const sourceKeypair = Keypair.fromSecret(sourceSecretKey);
     const sourcePublicKey = sourceKeypair.publicKey();
+
+    if (request.dryRun) {
+      return this.simulateBatch(batchId, sourcePublicKey, request);
+    }
 
     let attempts = 0;
     let lastError: Error | null = null;
@@ -412,36 +423,136 @@ export class BatchPaymentService {
   }
 
   /**
+   * Validate and estimate a batch without submitting it: per-recipient
+   * validation, estimated fee, and a balance check against the source account.
+   */
+  private async simulateBatch(
+    batchId: string,
+    sourcePublicKey: string,
+    request: BatchPaymentRequest
+  ): Promise<BatchDryRunResult> {
+    logger.info(`[Batch ${batchId}] Dry run: validating ${request.payments.length} operations`);
+
+    const recipients: DryRunRecipientResult[] = request.payments.map((payment, index) => {
+      const result: DryRunRecipientResult = {
+        index,
+        destination: payment.destination,
+        amount: payment.amount,
+        assetCode: payment.assetCode || 'XLM',
+        valid: true,
+      };
+      try {
+        this.validatePayment(payment, index);
+      } catch (error) {
+        result.valid = false;
+        result.error = error instanceof Error ? error.message : 'Unknown error';
+      }
+      return result;
+    });
+
+    // Stellar charges the base fee once per operation
+    const estimatedFee = (request.baseFee || 100) * request.payments.length;
+
+    let account: Horizon.AccountResponse;
+    try {
+      account = await this.server.loadAccount(sourcePublicKey);
+    } catch (error) {
+      throw new BatchPaymentError(
+        BatchErrorType.NETWORK_ERROR,
+        `Failed to load source account for dry run: ${error}`,
+        { error }
+      );
+    }
+
+    // Sum required amounts per asset in stroops to avoid floating point drift
+    const STROOPS = 10_000_000;
+    const required = new Map<string, { assetCode: string; assetIssuer?: string; stroops: number }>();
+    const addRequired = (assetCode: string, assetIssuer: string | undefined, stroops: number) => {
+      const key = assetCode === 'XLM' ? 'XLM' : `${assetCode}:${assetIssuer}`;
+      const entry = required.get(key) ?? { assetCode, assetIssuer, stroops: 0 };
+      entry.stroops += stroops;
+      required.set(key, entry);
+    };
+
+    addRequired('XLM', undefined, estimatedFee);
+    request.payments.forEach((payment, index) => {
+      if (!recipients[index].valid) return;
+      const assetCode = payment.assetCode || 'XLM';
+      addRequired(
+        assetCode,
+        assetCode === 'XLM' ? undefined : payment.assetIssuer,
+        Math.round(parseFloat(payment.amount) * STROOPS)
+      );
+    });
+
+    const totalCost: DryRunBalanceCheck[] = Array.from(required.values()).map((entry) => {
+      const balance = account.balances.find((b) =>
+        entry.assetCode === 'XLM'
+          ? b.asset_type === 'native'
+          : 'asset_code' in b && b.asset_code === entry.assetCode && b.asset_issuer === entry.assetIssuer
+      );
+      const availableStroops = balance ? Math.round(parseFloat(balance.balance) * STROOPS) : 0;
+      return {
+        assetCode: entry.assetCode,
+        ...(entry.assetIssuer ? { assetIssuer: entry.assetIssuer } : {}),
+        required: (entry.stroops / STROOPS).toFixed(7),
+        available: (availableStroops / STROOPS).toFixed(7),
+        sufficient: availableStroops >= entry.stroops,
+      };
+    });
+
+    const validOps = recipients.filter((r) => r.valid).length;
+
+    return {
+      dry_run: true,
+      transactionHash: null,
+      successfulOps: validOps,
+      totalOps: request.payments.length,
+      feePaid: 0,
+      sequenceNumber: account.sequenceNumber(),
+      estimatedFee,
+      totalCost,
+      recipients,
+      valid: validOps === request.payments.length && totalCost.every((c) => c.sufficient),
+    };
+  }
+
+  /**
    * Validate payment operations
    */
   private validatePayments(payments: PaymentOperation[]): void {
     for (let i = 0; i < payments.length; i++) {
-      const payment = payments[i];
+      this.validatePayment(payments[i], i);
+    }
+  }
 
-      // Validate destination address
-      if (!isValidStellarPublicKey(payment.destination)) {
+  /**
+   * Validate a single payment operation
+   */
+  private validatePayment(payment: PaymentOperation, i: number): void {
+    // Validate destination address
+    if (!isValidStellarPublicKey(payment.destination)) {
+      throw new BatchPaymentError(
+        BatchErrorType.INVALID_ADDRESS,
+        `Invalid destination Stellar address at index ${i}`
+      );
+    }
+
+    // Validate amount
+    if (!payment.amount || parseFloat(payment.amount) <= 0) {
+      throw new BatchPaymentError(
+        BatchErrorType.INVALID_ADDRESS,
+        `Invalid amount at index ${i}: ${payment.amount}`
+      );
+    }
+
+    // Validate asset if specified
+    if (payment.assetCode && payment.assetCode !== 'XLM') {
+      if (!isValidStellarPublicKey(payment.assetIssuer)) {
         throw new BatchPaymentError(
-          BatchErrorType.INVALID_ADDRESS,
-          `Invalid destination Stellar address at index ${i}`
+          BatchErrorType.INVALID_ASSET,
+          `Invalid asset issuer at index ${i} for asset ${payment.assetCode}`
         );
-      }
-
-      // Validate amount
-      if (!payment.amount || parseFloat(payment.amount) <= 0) {
-        throw new BatchPaymentError(
-          BatchErrorType.INVALID_ADDRESS,
-          `Invalid amount at index ${i}: ${payment.amount}`
-        );
-      }
-
-      // Validate asset if specified
-      if (payment.assetCode && payment.assetCode !== 'XLM') {
-        if (!isValidStellarPublicKey(payment.assetIssuer)) {
-          throw new BatchPaymentError(
-            BatchErrorType.INVALID_ASSET,
-            `Invalid asset issuer at index ${i} for asset ${payment.assetCode}`
-          );
-        }
       }
     }
   }

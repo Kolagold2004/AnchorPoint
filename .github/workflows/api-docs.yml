@@ -1,0 +1,62 @@
+name: API docs freshness
+
+on:
+  pull_request:
+    paths:
+      - "docs/openapi.json"
+      - "docs/api-reference.md"
+      - "tools/generate-api-docs.js"
+      - "backend/src/api/routes/**"
+      - "backend/src/config/swagger.ts"
+      - "backend/src/index.ts"
+      - "backend/scripts/generate-openapi.ts"
+      - "backend/scripts/validate-swagger.ts"
+      - ".github/workflows/api-docs.yml"
+  push:
+    branches: ["**"]
+    paths:
+      - "docs/openapi.json"
+      - "docs/api-reference.md"
+      - "tools/generate-api-docs.js"
+      - "backend/src/api/routes/**"
+      - "backend/src/config/swagger.ts"
+      - "backend/src/index.ts"
+      - "backend/scripts/generate-openapi.ts"
+      - "backend/scripts/validate-swagger.ts"
+      - ".github/workflows/api-docs.yml"
+
+jobs:
+  docs-fresh:
+    name: OpenAPI Markdown is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Verify generated API reference
+        run: node tools/generate-api-docs.js --check
+
+  backend-openapi:
+    name: Backend OpenAPI spec is valid
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: npm install --ignore-scripts --no-audit
+      - name: Fetch baseline spec
+        run: |
+          BASE_REF="${{ github.base_ref || github.event.repository.default_branch }}"
+          git show "origin/${BASE_REF}:backend/docs/openapi.json" > "${RUNNER_TEMP}/openapi-baseline.json" 2>/dev/null || true
+      - name: Generate OpenAPI spec and check for breaking changes
+        run: npm run generate:openapi -- --baseline "${RUNNER_TEMP}/openapi-baseline.json"
+      - name: Validate OpenAPI spec
+        run: npm run swagger:validate

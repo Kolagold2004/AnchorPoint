@@ -1,0 +1,151 @@
+{
+  "__inputs": [],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" }
+  ],
+  "annotations": { "list": [] },
+  "description": "AnchorPoint SEP flow latency — per-SEP (SEP-6, SEP-10, SEP-24, SEP-31) latency percentiles and error rates from sep_flow_duration_seconds.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 2 }, "unit": "s" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(sep_flow_duration_seconds_bucket{sep=~\"$sep\"}[5m])) by (le, sep))",
+          "legendFormat": "{{sep}} p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(sep_flow_duration_seconds_bucket{sep=~\"$sep\"}[5m])) by (le, sep))",
+          "legendFormat": "{{sep}} p50",
+          "refId": "B"
+        }
+      ],
+      "title": "SEP Flow Latency (p50 / p95) by SEP",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 2 }, "unit": "s" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(sep_flow_duration_seconds_bucket{sep=~\"$sep\"}[5m])) by (le, sep))",
+          "legendFormat": "{{sep}} p99",
+          "refId": "A"
+        }
+      ],
+      "title": "SEP Flow Latency (p99) by SEP",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 2 }, "unit": "s" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(sep_flow_duration_seconds_bucket{sep=~\"$sep\"}[5m])) by (le, sep, operation))",
+          "legendFormat": "{{sep}} {{operation}}",
+          "refId": "A"
+        }
+      ],
+      "title": "p95 Latency by Operation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 2 }, "unit": "percent" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "sum(rate(sep_flow_duration_seconds_count{sep=~\"$sep\",status=\"error\"}[5m])) by (sep) / sum(rate(sep_flow_duration_seconds_count{sep=~\"$sep\"}[5m])) by (sep) * 100",
+          "legendFormat": "{{sep}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Error Rate % by SEP",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 2 }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "id": 5,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "sum(rate(sep_flow_duration_seconds_count{sep=~\"$sep\"}[5m])) by (sep, status)",
+          "legendFormat": "{{sep}} {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "SEP Request Rate by Status",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["anchorpoint", "sep", "latency"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "name": "DS_PROMETHEUS",
+        "label": "Datasource",
+        "options": [],
+        "query": "prometheus",
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(sep_flow_duration_seconds_count, sep)",
+        "includeAll": true,
+        "multi": true,
+        "name": "sep",
+        "label": "SEP",
+        "query": "label_values(sep_flow_duration_seconds_count, sep)",
+        "refresh": 2,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "AnchorPoint SEP Flow Latency",
+  "uid": "anchorpoint-sep-flow-latency",
+  "version": 1
+}

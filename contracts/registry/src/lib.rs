@@ -42,6 +42,8 @@ pub enum DataKey {
     RegistryVersion,
     /// Paused state
     Paused,
+    /// Addresses permitted to register or update contracts
+    AuthorizedRegistrars,
 }
 
 #[contract]
@@ -49,38 +51,48 @@ pub struct Registry;
 
 #[contractimpl]
 impl Registry {
-    /// Initialize the registry with an admin address
+    /// Initialize the registry with an admin address.
+    ///
+    /// Panics with "already initialized" if called more than once, preventing
+    /// an attacker from overwriting the admin key after deployment.
     pub fn initialize(env: Env, admin: Address) {
+        // Double-initialization guard: revert if the admin key already exists.
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         admin.require_auth();
-        
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::RegistryVersion, &1u32);
         env.storage().instance().set(&DataKey::Paused, &false);
-        
+
         // Initialize empty contract types list
         let contract_types: Vec<String> = Vec::new(&env);
         env.storage().instance().set(&DataKey::AllContractTypes, &contract_types);
-        
+        let registrars: Vec<Address> = Vec::from_array(&env, [admin.clone()]);
+        env.storage().instance().set(&DataKey::AuthorizedRegistrars, &registrars);
+
+        // Emit RegistryInitialized event so off-chain indexers can detect deployment.
         env.events()
-            .publish((symbol_short!("init"), admin), 1u32);
+            .publish((symbol_short!("reg_init"),), admin);
     }
 
     /// Register a new contract or update an existing one
     pub fn register_contract(
         env: Env,
-        admin: Address,
+        registrar: Address,
         contract_type: String,
         address: Address,
         version: String,
     ) {
-        admin.require_auth();
+        registrar.require_auth();
         Self::check_not_paused(&env);
-        
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
-        assert!(admin == stored_admin, "unauthorized");
+        let registrars: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuthorizedRegistrars)
+            .unwrap_or(Vec::new(&env));
+        assert!(registrars.iter().any(|authorized| authorized == registrar), "unauthorized registrar");
         
         Self::check_not_zero_address(&env, &address);
         
@@ -153,6 +165,53 @@ impl Registry {
                     (address, version),
                 );
         }
+    }
+
+    /// Authorize an address to register or update contracts.
+    pub fn add_registrar(env: Env, admin: Address, registrar: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert!(admin == stored_admin, "unauthorized");
+
+        let mut registrars: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuthorizedRegistrars)
+            .unwrap_or(Vec::new(&env));
+        if !registrars.iter().any(|authorized| authorized == registrar) {
+            registrars.push_back(registrar.clone());
+            env.storage().instance().set(&DataKey::AuthorizedRegistrars, &registrars);
+        }
+        env.events().publish((symbol_short!("reg_add"),), registrar);
+    }
+
+    /// Revoke an address's ability to register or update contracts.
+    pub fn remove_registrar(env: Env, admin: Address, registrar: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert!(admin == stored_admin, "unauthorized");
+
+        let registrars: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuthorizedRegistrars)
+            .unwrap_or(Vec::new(&env));
+        let mut remaining: Vec<Address> = Vec::new(&env);
+        for authorized in registrars.iter() {
+            if authorized != registrar {
+                remaining.push_back(authorized);
+            }
+        }
+        env.storage().instance().set(&DataKey::AuthorizedRegistrars, &remaining);
+        env.events().publish((symbol_short!("reg_rmv"),), registrar);
+    }
+
+    /// Return the addresses currently authorized to register contracts.
+    pub fn get_authorized_registrars(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AuthorizedRegistrars)
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Deactivate a contract (mark as inactive without removing from registry)
@@ -456,6 +515,7 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use soroban_sdk::testutils::Address as _;
 
@@ -495,6 +555,57 @@ mod tests {
         assert_eq!(client.get_address(&contract_type), address);
         assert_eq!(client.get_version(&contract_type), version);
         assert!(client.is_active(&contract_type));
+    }
+
+    #[test]
+    fn test_admin_manages_registrars() {
+        let (env, client, admin) = setup();
+        let registrar = Address::generate(&env);
+
+        client.add_registrar(&admin, &registrar);
+        assert!(client
+            .get_authorized_registrars()
+            .iter()
+            .any(|authorized| authorized == registrar));
+
+        client.remove_registrar(&admin, &registrar);
+        assert!(!client
+            .get_authorized_registrars()
+            .iter()
+            .any(|authorized| authorized == registrar));
+    }
+
+    #[test]
+    fn test_authorized_registrar_can_register() {
+        let (env, client, admin) = setup();
+        let registrar = Address::generate(&env);
+        client.add_registrar(&admin, &registrar);
+
+        let contract_type = String::from_str(&env, "AMM");
+        client.register_contract(
+            &registrar,
+            &contract_type,
+            &Address::generate(&env),
+            &String::from_str(&env, "1.0.0"),
+        );
+
+        assert!(client.is_registered(&contract_type));
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized registrar")]
+    fn test_removed_registrar_cannot_register() {
+        let (env, client, admin) = setup();
+        let registrar = Address::generate(&env);
+        client.add_registrar(&admin, &registrar);
+        client.remove_registrar(&admin, &registrar);
+
+        client.register_contract(
+            &registrar,
+            &String::from_str(&env, "AMM"),
+            &Address::generate(&env),
+            &String::from_str(&env, "1.0.0"),
+        );
     }
 
     #[test]
@@ -744,5 +855,57 @@ mod tests {
         
         client.propose_admin(&admin, &new_admin);
         client.claim_admin(&imposter);
+    }
+
+    // -----------------------------------------------------------------------
+    // Double-initialization guard
+    // -----------------------------------------------------------------------
+
+    /// Verifies that calling `initialize` a second time is rejected, preventing
+    /// an attacker from overwriting the admin key after deployment.
+    #[test]
+    #[should_panic(expected = "already initialized")]
+    fn test_double_initialization_fails() {
+        let (env, client, _admin) = setup();
+
+        // A second call with a different admin must be rejected.
+        let attacker = Address::generate(&env);
+        client.initialize(&attacker);
+    }
+
+    /// Verifies that the admin key is unchanged after a failed double-init attempt.
+    #[test]
+    fn test_admin_unchanged_after_failed_double_init() {
+        let (env, client, admin) = setup();
+
+        // Attempt to reinitialize — expected to panic, so we catch it.
+        let attacker = Address::generate(&env);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.initialize(&attacker);
+        }));
+
+        // The panic should have occurred.
+        assert!(result.is_err(), "second initialize must panic");
+
+        // The admin must still be the original one.
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    /// Verifies the RegistryInitialized event is emitted on the first (valid) initialize.
+    #[test]
+    fn test_registry_initialized_event_emitted() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, Registry);
+        let client = RegistryClient::new(&env, &contract_id);
+
+        client.initialize(&admin);
+
+        // After initialization the admin must be set correctly.
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(client.get_registry_version(), 1);
+        assert!(!client.is_paused());
     }
 }

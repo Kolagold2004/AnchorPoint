@@ -10,6 +10,7 @@ import logger from '../../utils/logger';
 import { storageProvider } from '../../services/storage-provider.service';
 import { uploadStore } from '../../services/upload-store.service';
 import { config } from '../../config/env';
+import { softDeleteKycCustomer } from '../../services/data-retention.service';
 
 type UploadedFiles = { [fieldname: string]: Array<{ path: string }> };
 
@@ -159,7 +160,8 @@ export class Sep12Controller {
 
       const kycCustomer = await prisma.kycCustomer.upsert({
         where: { userId: user.id },
-        update: dbData,
+        // Re-submitting KYC restores a previously soft-deleted record.
+        update: { ...dbData, deletedAt: null },
         create: dbData,
       });
 
@@ -175,15 +177,38 @@ export class Sep12Controller {
       try {
         const providerRes = await kycProvider.submitCustomer(customerData, documents);
         providerStatus = providerRes.status;
+        const nextDbStatus = this.toDbStatus(providerRes.status);
 
-        await prisma.kycCustomer.update({
+        const updatedKyc = await prisma.kycCustomer.update({
           where: { id: kycCustomer.id },
           data: {
             provider: kycProvider.providerName,
             providerRef: providerRes.providerRef,
-            status: this.toDbStatus(providerRes.status),
+            status: nextDbStatus,
+          },
+          include: {
+            user: {
+              select: {
+                publicKey: true,
+              },
+            },
           },
         });
+
+        if (nextDbStatus !== KYCStatus.PENDING) {
+          const rejectionReasons =
+            (providerRes as any).rejectionReasons ??
+            (nextDbStatus === KYCStatus.REJECTED ? ['RISK_POLICY_VIOLATION'] : undefined);
+
+          defaultWebhookService
+            .sendKycStatusChanged(updatedKyc as any, KYCStatus.PENDING, rejectionReasons)
+            .catch((error) => {
+              logger.error('SEP-12 customer PUT status updated but webhook delivery failed', {
+                customerId: updatedKyc.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+        }
       } catch (providerError) {
         logger.error('SEP-12 customer provider submission failed', {
           error: providerError instanceof Error ? providerError.message : 'Unknown error',
@@ -214,7 +239,8 @@ export class Sep12Controller {
       if (!account) return res.status(400).json({ error: 'account is required' });
 
       const user = await prisma.user.findUnique({ where: { publicKey: account }, include: { kycCustomer: true } });
-      if (!user || !user.kycCustomer) {
+      // Relation includes bypass the soft-delete query filter, so check deletedAt here.
+      if (!user || !user.kycCustomer || user.kycCustomer.deletedAt) {
         return res.status(404).json({ error: 'Customer not found' });
       }
 
@@ -265,8 +291,8 @@ export class Sep12Controller {
       if (!account) return res.status(400).json({ error: 'account is required' });
 
       const user = await prisma.user.findUnique({ where: { publicKey: account } });
-      if (user) {
-        await prisma.kycCustomer.delete({ where: { userId: user.id } });
+      if (user && !(await softDeleteKycCustomer(user.id))) {
+        return res.status(404).json({ error: 'Customer not found' });
       }
       res.status(200).send();
     } catch (error) {
@@ -314,7 +340,7 @@ export class Sep12Controller {
           where: { publicKey: event.account },
           include: { kycCustomer: true },
         });
-        targetCustomer = user?.kycCustomer
+        targetCustomer = user?.kycCustomer && !user.kycCustomer.deletedAt
           ? { ...user.kycCustomer, user: { publicKey: user.publicKey } }
           : null;
       }
@@ -340,7 +366,14 @@ export class Sep12Controller {
         },
       });
 
-      defaultWebhookService.sendKycStatusChanged(updatedCustomer, previousStatus).catch((error) => {
+      const rejectionReasons =
+        (event as any).rejectionReasons ??
+        (req.body as any).rejection_reasons ??
+        (req.body as any).rejection_reason_codes ??
+        (req.body as any).reasons ??
+        (nextStatus === KYCStatus.REJECTED ? ['VERIFICATION_FAILED'] : undefined);
+
+      defaultWebhookService.sendKycStatusChanged(updatedCustomer as any, previousStatus, rejectionReasons).catch((error) => {
         logger.error('SEP-12 KYC status updated but webhook delivery failed', {
           customerId: updatedCustomer.id,
           error: error instanceof Error ? error.message : String(error),

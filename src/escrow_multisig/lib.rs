@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
+};
 
 #[contracttype]
 #[derive(Clone)]
@@ -28,6 +30,10 @@ impl EscrowMultisig {
         e.storage().instance().set(&DataKey::Threshold, &threshold);
         e.storage().instance().set(&DataKey::Recipient, &recipient);
         e.storage().instance().set(&DataKey::Initialized, &true);
+        e.events().publish(
+            (symbol_short!("esc_init"),),
+            (signers, threshold, recipient),
+        );
     }
 
     /// Release funds to the recipient.
@@ -54,8 +60,21 @@ impl EscrowMultisig {
             panic!("not enough signers provided");
         }
 
-        // Verify all provided signers are valid and have authorized the call
+        // Ensure the provided signers are strictly sorted and contain no duplicates.
+        // Without this check a single signer could supply the same signature multiple
+        // times to reach the configured threshold. We require signers[0] < signers[1] <
+        // ... < signers[n-1] which, by construction, also forbids duplicates.
+        let mut prev_signer: Option<String> = None;
         for signer in signers.iter() {
+            let signer_key = signer.to_string();
+            if let Some(ref prev) = prev_signer {
+                if *prev >= signer_key {
+                    panic!("duplicate or out-of-order signer");
+                }
+            }
+            prev_signer = Some(signer_key);
+
+            // Verify the signer is one of the configured signers.
             let mut is_valid = false;
             for stored_signer in stored_signers.iter() {
                 if signer == stored_signer {
@@ -77,6 +96,10 @@ impl EscrowMultisig {
 
         if balance > 0 {
             token_client.transfer(&e.current_contract_address(), &recipient, &balance);
+            e.events().publish(
+                (symbol_short!("released"),),
+                (signers, token, recipient, balance),
+            );
         }
     }
 
@@ -105,7 +128,11 @@ impl EscrowMultisig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, Env, Vec};
+    use soroban_sdk::{
+        testutils::{Address as _, Events},
+        token::{Client as TokenClient, StellarAssetClient},
+        vec as svec, Address, Env, IntoVal, Vec,
+    };
 
     #[test]
     fn test_multisig_escrow_release() {
@@ -162,6 +189,15 @@ mod tests {
         // Check balance of recipient
         assert_eq!(token_client.balance(&recipient), deposit_amount);
         assert_eq!(token_client.balance(&contract_id), 0);
+        let events = e.events().all();
+        assert_eq!(
+            events.get(events.len() - 1).unwrap(),
+            (
+                contract_id,
+                svec![&e, symbol_short!("released").into_val(&e)],
+                (m_signers, token_id.address(), recipient, deposit_amount).into_val(&e),
+            )
+        );
     }
 
     #[test]
@@ -207,6 +243,37 @@ mod tests {
         client.initialize(&signers, &threshold, &recipient);
 
         let m_signers = Vec::from_array(&e, [Address::generate(&e)]); // Random address not in signers
+        let token_id = Address::generate(&e); // dummy
+        client.release(&m_signers, &token_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate or out-of-order signer")]
+    fn test_duplicate_signers_rejected() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let signers = Vec::from_array(
+            &e,
+            [
+                Address::generate(&e),
+                Address::generate(&e),
+                Address::generate(&e),
+            ],
+        );
+        let threshold = 2;
+        let recipient = Address::generate(&e);
+
+        let contract_id = e.register(EscrowMultisig, ());
+        let client = EscrowMultisigClient::new(&e, &contract_id);
+
+        client.initialize(&signers, &threshold, &recipient);
+
+        // Same signer supplied twice to try to reach the threshold.
+        let m_signers = Vec::from_array(
+            &e,
+            [signers.get(0).unwrap(), signers.get(0).unwrap()],
+        );
         let token_id = Address::generate(&e); // dummy
         client.release(&m_signers, &token_id);
     }

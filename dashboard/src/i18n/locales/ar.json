@@ -1,0 +1,52 @@
+{
+  "language": {
+    "label": "اللغة",
+    "en": "English",
+    "es": "Español",
+    "pt": "Português",
+    "fr": "Français",
+    "ar": "العربية",
+    "he": "עברית"
+  },
+  "nav": {
+    "overview": "نظرة عامة",
+    "deposit": "إيداع",
+    "withdraw": "سحب",
+    "history": "السجل",
+    "sep38": "عرض سعر SEP-38",
+    "status": "حالة الخدمة",
+    "notifications": "الإشعارات",
+    "kyc": "حالة التحقق (KYC)",
+    "settings": "الإعدادات"
+  },
+  "wallet": {
+    "connect": "ربط المحفظة",
+    "connecting": "جارٍ الربط...",
+    "disconnect": "قطع الاتصال",
+    "freighter": "Freighter",
+    "albedo": "Albedo",
+    "rango": "Rango"
+  },
+  "settings": {
+    "title": "الإعدادات",
+    "appearance": "المظهر",
+    "appearanceSubtitle": "يتم حفظ اختيارك على هذا الجهاز.",
+    "theme": "السمة",
+    "language": "اللغة",
+    "languageSubtitle": "اختر لغتك المفضلة للوحة التحكم.",
+    "branding": "إعدادات الهوية والعلامة التجارية"
+  },
+  "staking": {
+    "title": "لوحة التحصيص في الوقت الفعلي",
+    "subtitle": "إدارة أرصدتك المحصصة، ومتابعة الأرباح في الوقت الفعلي وفترات القفل.",
+    "livePosition": "الموقع المباشر",
+    "stakedAmount": "المبلغ المحصص",
+    "earnedRewards": "المكافآت المكتسبة",
+    "lockTier": "فئة القفل",
+    "unlockDate": "تاريخ فتح القفل",
+    "apy": "العائد السنوي (APY)",
+    "stakeAction": "تحصيص المزيد",
+    "unstakeAction": "إلغاء التحصيص",
+    "claimAction": "المطالبة بالمكافآت"
+  }
+}

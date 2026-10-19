@@ -121,6 +121,62 @@ AnchorPoint/
    ```
 7. **Open a Pull Request** against `main`.
 
+### Secret Scanning (pre-commit)
+
+A leaked key cannot be un-leaked. Even if you delete the file and force-push,
+the blob stays in the reflog, in every clone, and on GitHub's servers until the
+credential is rotated. The repository therefore installs a
+[secretlint](https://github.com/secretlint/secretlint) pre-commit hook that scans
+staged content and aborts the commit when it finds a credential.
+
+**Nothing to install by hand.** The root `npm install` runs
+`scripts/install-git-hooks.mjs`, which points `core.hooksPath` at `.husky`. The
+hook uses the husky v9 layout, so if you later add husky itself the existing
+hook file is picked up unchanged.
+
+Verify it is active:
+
+```bash
+git config --get core.hooksPath   # -> .husky
+```
+
+**What it checks**
+
+- every staged file, via secretlint's recommended rule set (private keys, AWS,
+  GCP, GitHub, Slack, Stripe, npm, and generic high-entropy credentials)
+- a separate hard refusal for any staged `.env` file — only `*.env.example`
+  belongs in git, and `.env` is already gitignored, so this only fires on
+  `git add -f`
+- a PEM private-key header check that still runs when secretlint itself cannot
+  start (offline machine, cold npx cache)
+
+**Scan the whole repository at any time**
+
+```bash
+npm run lint:secrets
+```
+
+**Bypassing the hook**
+
+```bash
+SKIP_SECRETLINT=1 git commit -m "..."
+```
+
+Only for a false positive you have already confirmed, and say so in the commit
+message. The hook fails closed: if secretlint cannot run, the commit is
+aborted, because a contributor with no network must not be able to opt out of
+the check by accident.
+
+**If the hook blocks you with a real finding**
+
+1. Do not commit it. Unstage the file: `git reset -- <file>`.
+2. If the value is a live credential, rotate it first — removing the line is
+   not enough.
+3. Move the value into a real secret store or an untracked `.env`, and commit a
+   placeholder to `*.env.example` instead.
+4. If the finding is a placeholder that looks like a real key, add the path to
+   `.secretlintignore` with a comment explaining why it is safe.
+
 ### Commit Message Convention
 
 We follow [Conventional Commits](https://www.conventionalcommits.org/):
@@ -207,6 +263,49 @@ cargo test               # Run all contract tests
    cd dashboard && npm run dev
    ```
 3. Open http://localhost:5173 in your browser.
+
+### Mutation Testing
+
+Mutation testing (via [`cargo-mutants`](https://mutants.rs/)) measures how well the
+contract test suites detect injected bugs ("mutants"). Every mutant that is not
+caught by a failing test is a gap in the test coverage. The CI pipeline runs the
+mutation suite for the core token, staking, and liquid staking contracts; a PR
+must not leave any *missed* mutants.
+
+**Install the tool:**
+
+```bash
+cargo install cargo-mutants --locked
+```
+
+**Run locally** — the repository has two Cargo workspaces, each with its own
+`mutants.toml` config (cargo-mutants only auto-discovers `.cargo/mutants.toml`,
+so the config is passed explicitly with `--config`):
+
+```bash
+# Root workspace: SEP-41 token + staking contracts
+cargo mutants --config mutants.toml -p sep41-token -p staking -j 2
+
+# Contracts workspace: liquid staking (--in-place is required because the
+# contracts workspace references a crate outside of it via a path dependency)
+cd contracts && cargo mutants --config mutants.toml -p liquid_staking --in-place
+```
+
+A successful run ends with `0 missed` and exit code 0.
+
+**Guidelines for improving the mutation score:**
+
+- When a mutant is *missed*, add a focused edge-case test that exercises the
+  mutated behavior, e.g. zero amounts, negative inputs, boundary timestamps,
+  or the absence of an emitted event. See the `get_past_balance` balance-history
+tests in `src/token/lib.rs` or the string-helper tests in
+`contracts/liquid_staking/src/lib.rs` for examples.
+- Some mutants are *behaviorally equivalent* to the original code (e.g. a guard
+  changed from `> 0` to `>= 0` where a zero-value token transfer is a no-op).
+  These cannot be killed by any test; document them in the `exclude_re` list of
+the relevant `mutants.toml` with an explanation, and keep the file's comment
+up to date so the exclusion stays justified.
+- `unviable` mutants (that fail to compile) are expected and do not fail the run.
 
 ## Pull Request Guidelines
 

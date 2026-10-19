@@ -3,11 +3,27 @@ import { RedisService } from './redis.service';
 
 jest.mock('jsonwebtoken', () => ({
   sign: jest.fn(),
-  verify: jest.fn()
+  verify: jest.fn(),
+  decode: jest.fn()
 }));
 
-jest.mock('node:crypto', () => ({
-  randomBytes: jest.fn()
+jest.mock('node:crypto', () => {
+  const actual = jest.requireActual('node:crypto');
+  return {
+    ...actual,
+    randomBytes: jest.fn((size: number) => actual.randomBytes(size)),
+    randomUUID: jest.fn(() => actual.randomUUID())
+  };
+});
+
+jest.mock('../utils/logger', () => ({
+  __esModule: true,
+  default: {
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+    debug: jest.fn()
+  }
 }));
 
 const loadAuthService = () => {
@@ -17,8 +33,10 @@ const loadAuthService = () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const cryptoMock = require('node:crypto');
   // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const loggerMock = require('../utils/logger').default;
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
   const mod = require('./auth.service') as typeof import('./auth.service');
-  return { ...mod, jwtMock, cryptoMock };
+  return { ...mod, jwtMock, cryptoMock, loggerMock };
 };
 
 describe('Auth Service', () => {
@@ -57,21 +75,37 @@ describe('Auth Service', () => {
     expect(jwtMock.sign).toHaveBeenCalledWith({ sub: 'GBAD_PUBLIC_KEY' }, 'test-secret');
   });
 
-  it('verifyToken returns the `sub` claim when valid', () => {
+  it('signAccessToken signs with 15 min TTL (900s)', () => {
+    process.env.JWT_SECRET = 'test-secret';
+    const { signAccessToken, ACCESS_TOKEN_TTL_SECONDS, jwtMock } = loadAuthService();
+    (jwtMock.sign as jest.Mock).mockReturnValue('signed-access-token');
+
+    const token = signAccessToken('GBAD_PUBLIC_KEY');
+
+    expect(token).toBe('signed-access-token');
+    expect(ACCESS_TOKEN_TTL_SECONDS).toBe(900);
+    expect(jwtMock.sign).toHaveBeenCalledWith(
+      { sub: 'GBAD_PUBLIC_KEY' },
+      'test-secret',
+      { expiresIn: 900 }
+    );
+  });
+
+  it('verifyToken returns the `sub` claim when valid', async () => {
     process.env.JWT_SECRET = 'test-secret';
     const { verifyToken, jwtMock } = loadAuthService();
     (jwtMock.verify as jest.Mock).mockReturnValue({ sub: 'GVALID_PUBLIC_KEY' });
-    const decoded = verifyToken('tok_123');
+    const decoded = await verifyToken('tok_123');
 
     expect(decoded).toEqual({ sub: 'GVALID_PUBLIC_KEY' });
     expect(jwtMock.verify).toHaveBeenCalledWith('tok_123', 'test-secret');
   });
 
-  it('verifyToken throws when payload has no sub', () => {
+  it('verifyToken throws when payload has no sub', async () => {
     process.env.JWT_SECRET = 'test-secret';
     const { verifyToken, jwtMock } = loadAuthService();
     (jwtMock.verify as jest.Mock).mockReturnValue({});
-    expect(() => verifyToken('tok_123')).toThrow('Invalid token payload');
+    await expect(verifyToken('tok_123')).rejects.toThrow('Invalid token payload');
   });
 
   describe('Challenge Management', () => {
@@ -157,6 +191,154 @@ describe('Auth Service', () => {
       await removeChallenge(mockRedisService as RedisService, publicKey);
 
       expect(mockRedisService.del).toHaveBeenCalledWith('sep10:challenge:GBAD_PUBLIC_KEY');
+    });
+  });
+
+  describe('Refresh Token Issuance, Rotation, and Reuse Detection', () => {
+    let store: Map<string, string>;
+    let redisService: RedisService;
+
+    beforeEach(() => {
+      store = new Map<string, string>();
+      redisService = new RedisService({
+        get: async (key: string) => store.get(key) ?? null,
+        set: async (key: string, value: string) => {
+          store.set(key, value);
+          return 'OK';
+        },
+        del: async (key: string) => (store.delete(key) ? 1 : 0),
+        expire: async () => 1
+      });
+    });
+
+    it('issues access_token (15m TTL) and refresh_token (7d TTL) and stores hashed refresh token in Redis', async () => {
+      process.env.JWT_SECRET = 'test-secret';
+      const {
+        issueTokenPair,
+        hashRefreshToken,
+        ACCESS_TOKEN_TTL_SECONDS,
+        REFRESH_TOKEN_TTL_SECONDS,
+        jwtMock
+      } = loadAuthService();
+      (jwtMock.sign as jest.Mock).mockReturnValue('access-jwt-1');
+
+      const setJSONSpy = jest.spyOn(redisService, 'setJSON');
+      const pair = await issueTokenPair('GUSER_PUBLIC_KEY', redisService);
+
+      expect(pair.access_token).toBe('access-jwt-1');
+      expect(typeof pair.refresh_token).toBe('string');
+      expect(pair.refresh_token.length).toBeGreaterThanOrEqual(64);
+      expect(pair.expires_in).toBe(ACCESS_TOKEN_TTL_SECONDS);
+      expect(pair.expires_in).toBe(900);
+      expect(pair.refresh_expires_in).toBe(REFRESH_TOKEN_TTL_SECONDS);
+      expect(pair.refresh_expires_in).toBe(7 * 24 * 60 * 60);
+
+      // Verify raw refresh token is NOT used as Redis key; hashed token is used
+      const tokenHash = hashRefreshToken(pair.refresh_token);
+      expect(tokenHash).not.toBe(pair.refresh_token);
+      expect(store.has(`auth:refresh:${pair.refresh_token}`)).toBe(false);
+      expect(store.has(`auth:refresh:${tokenHash}`)).toBe(true);
+
+      const storedRecord = await redisService.getJSON<any>(`auth:refresh:${tokenHash}`);
+      expect(storedRecord).toMatchObject({
+        familyId: pair.familyId,
+        publicKey: 'GUSER_PUBLIC_KEY',
+        status: 'active'
+      });
+
+      expect(setJSONSpy).toHaveBeenCalledWith(
+        `auth:refresh:${tokenHash}`,
+        expect.objectContaining({ status: 'active', publicKey: 'GUSER_PUBLIC_KEY' }),
+        REFRESH_TOKEN_TTL_SECONDS
+      );
+    });
+
+    it('rotates a valid refresh token, returns a new pair, and marks the old token as rotated', async () => {
+      process.env.JWT_SECRET = 'test-secret';
+      const {
+        issueTokenPair,
+        rotateRefreshToken,
+        hashRefreshToken,
+        jwtMock
+      } = loadAuthService();
+      (jwtMock.sign as jest.Mock)
+        .mockReturnValueOnce('access-jwt-initial')
+        .mockReturnValueOnce('access-jwt-rotated');
+
+      const initialPair = await issueTokenPair('GUSER_PUBLIC_KEY', redisService);
+      const rotatedPair = await rotateRefreshToken(initialPair.refresh_token, redisService);
+
+      expect(rotatedPair.access_token).toBe('access-jwt-rotated');
+      expect(rotatedPair.refresh_token).not.toBe(initialPair.refresh_token);
+      expect(rotatedPair.familyId).toBe(initialPair.familyId);
+      expect(rotatedPair.publicKey).toBe('GUSER_PUBLIC_KEY');
+
+      const oldHash = hashRefreshToken(initialPair.refresh_token);
+      const newHash = hashRefreshToken(rotatedPair.refresh_token);
+
+      const oldRecord = await redisService.getJSON<any>(`auth:refresh:${oldHash}`);
+      const newRecord = await redisService.getJSON<any>(`auth:refresh:${newHash}`);
+
+      expect(oldRecord?.status).toBe('rotated');
+      expect(newRecord?.status).toBe('active');
+    });
+
+    it('triggers a security alert and invalidates the entire session family when a rotated token is reused', async () => {
+      process.env.JWT_SECRET = 'test-secret';
+      const {
+        issueTokenPair,
+        rotateRefreshToken,
+        hashRefreshToken,
+        RefreshTokenReuseError,
+        jwtMock,
+        loggerMock
+      } = loadAuthService();
+      (jwtMock.sign as jest.Mock).mockReturnValue('access-jwt');
+
+      // 1. Issue initial token pair (token 1)
+      const pair1 = await issueTokenPair('GUSER_PUBLIC_KEY', redisService);
+
+      // 2. Rotate token 1 -> issues token 2
+      const pair2 = await rotateRefreshToken(pair1.refresh_token, redisService);
+
+      // 3. Rotate token 2 -> issues token 3
+      const pair3 = await rotateRefreshToken(pair2.refresh_token, redisService);
+
+      // 4. Attempt to reuse already-rotated token 1
+      await expect(rotateRefreshToken(pair1.refresh_token, redisService)).rejects.toThrow(
+        RefreshTokenReuseError
+      );
+
+      // Security alert must be logged
+      expect(loggerMock.error).toHaveBeenCalledWith(
+        expect.stringContaining('SECURITY ALERT: Refresh token reuse detected'),
+        expect.objectContaining({
+          alertType: 'REFRESH_TOKEN_REUSE',
+          severity: 'critical',
+          familyId: pair1.familyId,
+          publicKey: 'GUSER_PUBLIC_KEY'
+        })
+      );
+
+      // Entire session family must be invalidated (including the latest active token 3)
+      const hash3 = hashRefreshToken(pair3.refresh_token);
+      expect(await redisService.getJSON(`auth:refresh:${hash3}`)).toBeNull();
+
+      const familyRecord = await redisService.getJSON<any>(`auth:refresh_family:${pair1.familyId}`);
+      expect(familyRecord?.revoked).toBe(true);
+
+      // Subsequent attempt to use token 3 must fail
+      await expect(rotateRefreshToken(pair3.refresh_token, redisService)).rejects.toThrow(
+        'Invalid or expired refresh token'
+      );
+    });
+
+    it('rejects unknown or expired refresh tokens', async () => {
+      const { rotateRefreshToken } = loadAuthService();
+
+      await expect(rotateRefreshToken('non-existent-token', redisService)).rejects.toThrow(
+        'Invalid or expired refresh token'
+      );
     });
   });
 });

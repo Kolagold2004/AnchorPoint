@@ -38,6 +38,8 @@ export interface BatchPaymentRequest {
   baseFee?: number;
   /** Optional timeout in seconds (default: 300) */
   timeoutInSeconds?: number;
+  /** Validate and estimate the batch without submitting it to the network */
+  dryRun?: boolean;
 }
 
 export interface BatchPaymentResult {
@@ -55,6 +57,42 @@ export interface BatchPaymentResult {
   ledger?: number;
   /** Timestamp of successful submission */
   timestamp?: Date;
+}
+
+export interface DryRunRecipientResult {
+  /** Index of the payment in the request */
+  index: number;
+  destination: string;
+  amount: string;
+  assetCode: string;
+  /** Whether the payment passed validation */
+  valid: boolean;
+  /** Validation error, if any */
+  error?: string;
+}
+
+export interface DryRunBalanceCheck {
+  assetCode: string;
+  assetIssuer?: string;
+  /** Total amount required for this asset (including fees for XLM) */
+  required: string;
+  /** Balance currently available on the source account */
+  available: string;
+  sufficient: boolean;
+}
+
+export interface BatchDryRunResult extends Omit<BatchPaymentResult, 'transactionHash'> {
+  /** No transaction is submitted during a dry run */
+  transactionHash: null;
+  dry_run: true;
+  /** Estimated transaction fee in stroops */
+  estimatedFee: number;
+  /** Total cost per asset (payments plus fees) */
+  totalCost: DryRunBalanceCheck[];
+  /** Per-recipient validation results */
+  recipients: DryRunRecipientResult[];
+  /** Whether every recipient is valid and every balance is sufficient */
+  valid: boolean;
 }
 
 export interface PartialFailureResult {

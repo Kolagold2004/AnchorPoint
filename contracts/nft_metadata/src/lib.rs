@@ -206,6 +206,10 @@ impl NftMetadataContract {
             icon_url: String::from_str(&env, ""),
             website: String::from_str(&env, ""),
         });
+        env.events().publish(
+            (symbol_short!("nft_init"),),
+            (admin, collection.name, collection.symbol),
+        );
     }
 
     // ========================================================================
@@ -730,6 +734,8 @@ impl NftMetadataContract {
         }
 
         // Topic: event name only; owner + operator + approved in data.
+        env.events()
+            .publish((symbol_short!("appr_all"), owner.clone(), operator), approved);
         env.events().publish(
             (symbol_short!("appr_all"),),
             (owner, operator, approved),
@@ -824,6 +830,8 @@ impl NftMetadataContract {
         collection.image = image;
 
         env.storage().instance().set(&DataKey::CollectionMetadata, &collection);
+        env.events()
+            .publish((symbol_short!("coll_upd"),), (caller, collection));
     }
 
     // ========================================================================

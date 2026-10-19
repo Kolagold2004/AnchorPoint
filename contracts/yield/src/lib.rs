@@ -53,6 +53,8 @@ impl YieldDistribution {
             panic!("already set");
         }
         env.storage().instance().set(&soroban_sdk::symbol_short!("sec_reg"), &registry);
+        env.events()
+            .publish((symbol_short!("sec_reg"),), registry);
     }
 
     // ── Admin / initialisation ────────────────────────────────────────────
@@ -74,6 +76,8 @@ impl YieldDistribution {
         env.storage()
             .instance()
             .set(&DataKey::RewardPerTokenStored, &0_i128);
+        env.events()
+            .publish((symbol_short!("init"),), (admin, stake_token, reward_token));
     }
 
     /// Deposit `amount` of reward tokens into the contract for distribution.
@@ -260,9 +264,9 @@ impl YieldDistribution {
                 &reward,
             );
 
-            env.events()
-                .publish((symbol_short!("claimed"),), (user, reward));
         }
+        env.events()
+            .publish((symbol_short!("claimed"),), (user, reward));
 
         reward
     }

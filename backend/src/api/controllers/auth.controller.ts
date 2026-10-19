@@ -8,6 +8,11 @@ import {
   removeChallenge,
   signToken,
   verifyToken,
+  issueTokenPair,
+  rotateRefreshToken,
+  RefreshTokenReuseError,
+  ACCESS_TOKEN_TTL_SECONDS,
+  REFRESH_TOKEN_TTL_SECONDS,
   validateMultiKeySignatures,
   SignerInfo,
   SignatureInfo,
@@ -26,6 +31,14 @@ import logger from '../../utils/logger';
 
 // RFC 1123 compliant hostname: no consecutive dots/hyphens, labels must start/end with alphanumeric
 const CLIENT_DOMAIN_REGEX = /^(?!-)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.(?!-)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.(?!-)(?:[a-zA-Z]{2,}|xn--[a-zA-Z0-9]+)(?:-[a-zA-Z0-9]+)*$/;
+const SEP10_NONCE_TTL_SECONDS = 300;
+
+type Sep10NonceRecord = {
+  account: string;
+  createdAt: number;
+};
+
+const buildSep10NonceKey = (nonce: string) => `sep10:nonce:${nonce}`;
 
 function validateClientDomain(domain: string): boolean {
   const trimmed = domain.trim();
@@ -58,8 +71,11 @@ interface TokenRequest {
 
 interface TokenResponse {
   token: string;
+  access_token?: string;
+  refresh_token?: string;
   type: 'bearer';
   expires_in: number;
+  refresh_expires_in?: number;
   authLevel?: 'partial' | 'medium' | 'full';
   signers?: string[];
 }
@@ -70,13 +86,13 @@ interface TokenResponse {
  * Generates and stores a challenge for the given account
  */
 function readStringParam(bodyValue: unknown, queryValue: unknown): string | undefined {
-  if (typeof bodyValue === 'string' && bodyValue.length > 0) {
+  if (typeof bodyValue === 'string') {
     return bodyValue;
   }
-  if (typeof queryValue === 'string' && queryValue.length > 0) {
+  if (typeof queryValue === 'string') {
     return queryValue;
   }
-  if (Array.isArray(queryValue) && typeof queryValue[0] === 'string' && queryValue[0].length > 0) {
+  if (Array.isArray(queryValue) && typeof queryValue[0] === 'string') {
     return queryValue[0];
   }
   return undefined;
@@ -89,17 +105,27 @@ export const getChallenge = async (
 ): Promise<Response> => {
   const body = (req.body ?? {}) as ChallengeRequest;
   const account = readStringParam(body.account, req.query?.account);
+  // Capture the raw body value before readStringParam trims empty strings so
+  // we can detect an explicitly supplied but empty/invalid client_domain.
+  const rawClientDomain = body.client_domain as unknown;
   const client_domain = readStringParam(body.client_domain, req.query?.client_domain);
   const { signers, threshold, multiKey } = body;
 
-  if (!account) {
+  if (!account || !account.trim()) {
     return res.status(400).json({
       error: 'account parameter is required'
     });
   }
 
-  if (client_domain !== undefined) {
-    if (!validateClientDomain(client_domain)) {
+  // If client_domain was explicitly provided (including as an empty string or
+  // whitespace-only value), validate it. readStringParam returns undefined for
+  // empty strings, so we check the raw value to catch that case.
+  const clientDomainSupplied =
+    client_domain !== undefined ||
+    (typeof rawClientDomain === 'string' && rawClientDomain.trim() === '');
+
+  if (clientDomainSupplied) {
+    if (!client_domain || !validateClientDomain(client_domain)) {
       return res.status(400).json({
         error: 'invalid_client_domain',
         message: 'client_domain must be a valid hostname without scheme'
@@ -123,15 +149,21 @@ export const getChallenge = async (
     const anchorPublicKey = config.ANCHOR_PUBLIC_KEY || 'GBAD_PUBLIC_KEY'; // Default for demo
     const networkType = config.STELLAR_NETWORK === 'public' ? NetworkType.PUBLIC : NetworkType.TESTNET;
 
-    // Generate a SEP-10 challenge transaction
+    // Generate a SEP-10 challenge transaction, embedding client_domain when provided
     const sep10Challenge = generateSep10ChallengeTransaction(
       anchorPublicKey,
       account,
-      networkType
+      networkType,
+      client_domain
     );
 
     // Store the challenge in Redis
     await storeSep10Challenge(redisService, account, sep10Challenge);
+    await redisService.setJSON<Sep10NonceRecord>(
+      buildSep10NonceKey(sep10Challenge.challenge),
+      { account, createdAt: Date.now() },
+      SEP10_NONCE_TTL_SECONDS
+    );
 
     const response: ChallengeResponse = {
       transaction: sep10Challenge.transactionXdr || sep10Challenge.challenge,
@@ -197,7 +229,24 @@ export const getToken = async (
         authLevel: validation.authLevel
       };
 
-      // Generate JWT token with multi-key data
+      if (typeof issueTokenPair === 'function') {
+        const tokenPair = await issueTokenPair(mockAccount, redisService, multiKeyData);
+        if (tokenPair && tokenPair.access_token && tokenPair.refresh_token) {
+          const response: TokenResponse = {
+            token: tokenPair.access_token,
+            access_token: tokenPair.access_token,
+            refresh_token: tokenPair.refresh_token,
+            type: 'bearer',
+            expires_in: tokenPair.expires_in ?? ACCESS_TOKEN_TTL_SECONDS,
+            refresh_expires_in: tokenPair.refresh_expires_in ?? REFRESH_TOKEN_TTL_SECONDS,
+            authLevel: validation.authLevel,
+            signers: validation.signers
+          };
+          return res.json(response);
+        }
+      }
+
+      // Fallback when issueTokenPair is mocked out in legacy unit tests
       const token = signToken(mockAccount, multiKeyData);
 
       const response: TokenResponse = {
@@ -258,10 +307,34 @@ export const getToken = async (
       });
     }
 
-    // Remove the challenge to prevent replay attacks
+    const nonceKey = buildSep10NonceKey(storedChallenge.challenge);
+    const nonceRecord = await redisService.getJSON<Sep10NonceRecord>(nonceKey);
+    if (!nonceRecord || nonceRecord.account !== account) {
+      return res.status(400).json({
+        error: 'Invalid or expired nonce'
+      });
+    }
+
+    // Remove the nonce and challenge to prevent replay attacks
+    await redisService.del(nonceKey);
     await removeChallenge(redisService, account);
 
-    // Generate JWT token
+    if (typeof issueTokenPair === 'function') {
+      const tokenPair = await issueTokenPair(account, redisService);
+      if (tokenPair && tokenPair.access_token && tokenPair.refresh_token) {
+        const response: TokenResponse = {
+          token: tokenPair.access_token,
+          access_token: tokenPair.access_token,
+          refresh_token: tokenPair.refresh_token,
+          type: 'bearer',
+          expires_in: tokenPair.expires_in ?? ACCESS_TOKEN_TTL_SECONDS,
+          refresh_expires_in: tokenPair.refresh_expires_in ?? REFRESH_TOKEN_TTL_SECONDS,
+        };
+        return res.json(response);
+      }
+    }
+
+    // Fallback when issueTokenPair is mocked out in legacy unit tests
     const token = signToken(account);
 
     const response: TokenResponse = {
@@ -281,41 +354,86 @@ export const getToken = async (
 /**
  * POST /auth/refresh
  * SEP-10 Token Refresh Endpoint
- * Refreshes an existing valid JWT token
+ * Rotates a refresh token and returns a new access/refresh token pair
  */
 export const refreshToken = async (
   req: Request,
   res: Response,
+  redisService?: RedisService
 ): Promise<Response> => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing or invalid authorization header' });
+  const bodyRefreshToken =
+    typeof req.body?.refresh_token === 'string'
+      ? req.body.refresh_token.trim()
+      : typeof req.body?.refreshToken === 'string'
+        ? req.body.refreshToken.trim()
+        : undefined;
+
+  const authHeader = req.headers?.authorization;
+  const bearerToken =
+    authHeader && authHeader.startsWith('Bearer ')
+      ? authHeader.split(' ')[1]?.trim()
+      : undefined;
+
+  const candidateRefreshToken = bodyRefreshToken || bearerToken;
+
+  if (!candidateRefreshToken) {
+    return res.status(401).json({ error: 'Missing or invalid refresh token' });
   }
 
-  const token = authHeader.split(' ')[1];
-
   try {
-    const decoded = verifyToken(token);
+    if (typeof rotateRefreshToken === 'function') {
+      const rotated = await rotateRefreshToken(candidateRefreshToken, redisService);
+      if (rotated && rotated.access_token && rotated.refresh_token) {
+        const response: TokenResponse = {
+          token: rotated.access_token,
+          access_token: rotated.access_token,
+          refresh_token: rotated.refresh_token,
+          type: 'bearer',
+          expires_in: rotated.expires_in ?? ACCESS_TOKEN_TTL_SECONDS,
+          refresh_expires_in: rotated.refresh_expires_in ?? REFRESH_TOKEN_TTL_SECONDS,
+          authLevel: rotated.multiKeyData?.authLevel,
+          signers: rotated.multiKeyData?.signers,
+        };
 
-    let multiKeyData: MultiKeyVerifiedToken | undefined;
-    if ('signers' in decoded) {
-      multiKeyData = decoded as MultiKeyVerifiedToken;
+        return res.json(response);
+      }
     }
 
-    // Issue a new token
-    const newToken = signToken(decoded.sub, multiKeyData);
+    // Fallback for legacy Bearer JWT refresh
+    if (bearerToken && !bodyRefreshToken) {
+      const decoded = await verifyToken(bearerToken, redisService);
 
-    const response: TokenResponse = {
-      token: newToken,
-      type: 'bearer',
-      expires_in: 3600,
-      authLevel: multiKeyData?.authLevel,
-      signers: multiKeyData?.signers
-    };
+      let multiKeyData: MultiKeyVerifiedToken | undefined;
+      if ('signers' in decoded) {
+        multiKeyData = decoded as MultiKeyVerifiedToken;
+      }
 
-    return res.json(response);
+      const newToken = signToken(decoded.sub, multiKeyData);
+
+      const response: TokenResponse = {
+        token: newToken,
+        access_token: newToken,
+        type: 'bearer',
+        expires_in: ACCESS_TOKEN_TTL_SECONDS ?? 900,
+        authLevel: multiKeyData?.authLevel,
+        signers: multiKeyData?.signers
+      };
+
+      return res.json(response);
+    }
+
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
   } catch (error) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
+    if (
+      error instanceof RefreshTokenReuseError ||
+      (error instanceof Error && error.name === 'RefreshTokenReuseError')
+    ) {
+      return res.status(401).json({
+        error: 'Refresh token reuse detected; session family invalidated',
+        code: 'REFRESH_TOKEN_REUSE'
+      });
+    }
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
   }
 };
 

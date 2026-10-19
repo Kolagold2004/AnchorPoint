@@ -54,6 +54,8 @@ impl GovernanceContract {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.events()
+            .publish((symbol_short!("gov_init"),), admin);
     }
 
     /// Configure the vector of governance council address signers and required threshold (M of N).
@@ -64,6 +66,10 @@ impl GovernanceContract {
         assert!(threshold > 0 && threshold <= signers.len(), "invalid threshold");
         env.storage().instance().set(&DataKey::CouncilSigners, &signers);
         env.storage().instance().set(&DataKey::Threshold, &threshold);
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("council")),
+            (admin, signers, threshold),
+        );
     }
 
     /// Get configured council signers.

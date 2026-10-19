@@ -6,7 +6,10 @@ if (!process.env.DATABASE_URL) {
 
 import { PrismaClient } from '@prisma/client';
 import { metricsService } from '../services/metrics.service';
+import { piiEncryptionMiddleware } from '../services/crypto.service';
 import { config } from '../config/env';
+import logger from '../utils/logger';
+import { softDeleteExtension } from './soft-delete';
 
 declare global {
   // eslint-disable-next-line no-var
@@ -60,7 +63,7 @@ async function connectWithRetry(client: PrismaClient): Promise<void> {
   for (let attempt = 1; attempt <= MAX_CONNECT_RETRIES; attempt++) {
     try {
       await client.$connect();
-      console.log('[Prisma] Successfully connected to database');
+      logger.info('[Prisma] Successfully connected to database');
       return;
     } catch (error) {
       if (attempt === MAX_CONNECT_RETRIES) {
@@ -87,9 +90,10 @@ async function connectWithRetry(client: PrismaClient): Promise<void> {
 // ── Client instantiation ──────────────────────────────────────────────
 const databaseUrl = buildDatabaseUrl();
 
-const prismaClientOptions = databaseUrl !== process.env.DATABASE_URL
-  ? { datasources: { db: { url: databaseUrl } } }
-  : {};
+const prismaClientOptions: { datasources: { db: { url: string } } } | undefined =
+  databaseUrl !== process.env.DATABASE_URL
+    ? { datasources: { db: { url: databaseUrl } } }
+    : undefined;
 
 const prisma =
   global.__prisma ??
@@ -121,7 +125,20 @@ if (typeof prismaAny.$use === 'function') {
       metricsService.observeDbQuery(queryType, seconds);
     }
   });
+
+  // PII encryption middleware – transparently encrypts sensitive fields before
+  // writing to the database and decrypts them on read.
+  prismaAny.$use(piiEncryptionMiddleware as unknown as (params: PrismaMiddlewareParams, next: PrismaMiddleware) => Promise<unknown>);
 }
+
+// ── Soft-delete filtering (#1197) ─────────────────────────────────────
+// Query extensions leave the client's model types unchanged, so the extended
+// client is exposed under the plain PrismaClient type.
+const prismaExtendable = prisma as unknown as { $extends?: (ext: unknown) => unknown };
+const client: PrismaClient =
+  typeof prismaExtendable.$extends === 'function'
+    ? (prismaExtendable.$extends(softDeleteExtension) as PrismaClient)
+    : prisma;
 
 // ── Startup connection retry (production only) ────────────────────────
 // Eagerly verify the database connection on startup so the process fails
@@ -133,4 +150,4 @@ if (process.env.NODE_ENV === 'production') {
   });
 }
 
-export default prisma;
+export default client;

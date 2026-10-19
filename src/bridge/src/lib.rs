@@ -4,6 +4,8 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
 };
 
+const DEFAULT_REPLAY_WINDOW_LEDGERS: u32 = 604_800;
+
 /// Supported bridge operations.
 #[contracttype]
 #[derive(Clone)]
@@ -55,6 +57,10 @@ pub enum DataKey {
     EmergencyMode,
     /// User locked balance for emergency withdrawal.
     LockedBalance(Address),
+    /// Maximum ledger age for rejecting a previously processed message.
+    ReplayWindowLedgers,
+    /// Processing ledger for a hash; separate to preserve the legacy bool value.
+    ProcessedAt(BytesN<32>),
 }
 
 #[contract]
@@ -86,6 +92,9 @@ impl Bridge {
         env.storage()
             .instance()
             .set(&DataKey::MinCollateralRatio, &min_collateral_ratio);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReplayWindowLedgers, &DEFAULT_REPLAY_WINDOW_LEDGERS);
 
         // Initialize last activity timestamp
         env.storage()
@@ -96,6 +105,25 @@ impl Bridge {
         env.storage()
             .instance()
             .set(&DataKey::EmergencyMode, &false);
+        env.events().publish(
+            (symbol_short!("br_init"),),
+            (admin, relayer_key, min_collateral_ratio),
+        );
+    }
+
+    /// Set the replay-protection window in ledgers (admin only).
+    pub fn set_replay_window_ledgers(env: Env, admin: Address, ledgers: u32) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set");
+        assert!(admin == stored_admin, "unauthorized");
+        assert!(ledgers > 0, "replay window must be positive");
+        env.storage()
+            .instance()
+            .set(&DataKey::ReplayWindowLedgers, &ledgers);
     }
 
     // -----------------------------------------------------------------------
@@ -133,10 +161,28 @@ impl Bridge {
 
         // 2. Replay protection
         let processed_key = DataKey::Processed(msg.message_hash.clone());
+        let processed_at_key = DataKey::ProcessedAt(msg.message_hash.clone());
+        let replay_window = Self::replay_window_ledgers(env.clone());
+        let sequence = env.ledger().sequence();
         if env.storage().persistent().has(&processed_key) {
-            panic!("message already processed");
+            let processed_at = env.storage().persistent().get::<_, u32>(&processed_at_key);
+            assert!(
+                processed_at
+                    .map(|processed_at| sequence.saturating_sub(processed_at) >= replay_window)
+                    .unwrap_or(false),
+                "message already processed"
+            );
         }
         env.storage().persistent().set(&processed_key, &true);
+        env.storage()
+            .persistent()
+            .set(&processed_at_key, &sequence);
+        env.storage()
+            .persistent()
+            .extend_ttl(&processed_key, 1, replay_window);
+        env.storage()
+            .persistent()
+            .extend_ttl(&processed_at_key, 1, replay_window);
 
         // Update last relayer activity timestamp
         env.storage()
@@ -431,9 +477,28 @@ impl Bridge {
 
     /// Returns `true` if the given message hash has already been processed.
     pub fn is_processed(env: Env, message_hash: BytesN<32>) -> bool {
+        let processed_key = DataKey::Processed(message_hash.clone());
+        if !env.storage().persistent().has(&processed_key) {
+            return false;
+        }
         env.storage()
             .persistent()
-            .has(&DataKey::Processed(message_hash))
+            .get::<_, u32>(&DataKey::ProcessedAt(message_hash))
+            .map(|sequence| {
+                env.ledger()
+                    .sequence()
+                    .saturating_sub(sequence)
+                    < Self::replay_window_ledgers(env.clone())
+            })
+            .unwrap_or(true)
+    }
+
+    /// Returns the configured replay window in ledgers.
+    pub fn replay_window_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReplayWindowLedgers)
+            .unwrap_or(DEFAULT_REPLAY_WINDOW_LEDGERS)
     }
 
     /// Returns the stored relayer public key.
@@ -613,6 +678,7 @@ mod tests {
     #[test]
     fn test_mint_tracks_destination_minted() {
         let (env, client, admin, relayer, _, secret) = setup_with_secret();
+        client.set_replay_window_ledgers(&admin, &5);
         let source_chain = 1u32;
         let _token = Address::generate(&env);
         let recipient = Address::generate(&env);
@@ -640,6 +706,19 @@ mod tests {
         assert_eq!(
             client.get_destination_minted(&source_chain, &token_id.address()),
             1000
+        );
+
+        let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.process_message(&relayer, &msg);
+        }));
+        assert!(duplicate.is_err());
+
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + 6);
+        client.process_message(&relayer, &msg);
+        assert_eq!(
+            client.get_destination_minted(&source_chain, &token_id.address()),
+            2000
         );
     }
 
